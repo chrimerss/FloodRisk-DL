@@ -3,19 +3,16 @@ defaults:
   
 # Data settings
 data:
-  data_dir: "data"
-  train_ratio: 0.7
-  val_ratio: 0.15
-  test_ratio: 0.15
-  batch_size: 16
+  h5_file: "flood_data.h5"  # Path to the H5 dataset
+  batch_size: 8
   num_workers: 4
   
 # Model settings
 model:
   name: "swin_transformer"
-  img_size: 224
+  img_size: 1024  # Target image size
   patch_size: 4
-  in_channels: 2  # Rainfall and DEM
+  in_channels: 2  # DEM and rainfall
   embed_dim: 96
   depths: [2, 2, 6, 2]
   num_heads: [3, 6, 12, 24]
@@ -36,7 +33,7 @@ training:
 # Logging settings
 logging:
   project_name: "flood-risk-prediction"
-  log_every_n_steps: 50
+  log_every_n_steps: 10
   save_top_k: 3
   monitor: "val_loss"
   mode: "min" 

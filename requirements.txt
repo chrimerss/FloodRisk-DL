@@ -8,4 +8,6 @@ pandas>=1.5.0
 matplotlib>=3.5.0
 rasterio>=1.3.0  # For handling geospatial data
 scikit-learn>=1.0.0
-hydra-core>=1.3.0  # For configuration management 
+hydra-core>=1.3.0  # For configuration management
+h5py>=3.6.0  # For H5 dataset handling
+tqdm>=4.64.0  # For progress bars 

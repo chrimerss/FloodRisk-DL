@@ -1,0 +1,162 @@
+[
+    {
+        "City ID": "HOU001",
+        "Desc": "Houston d01",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm"
+    },
+    {
+        "City ID": "HOU002",
+        "Desc": "Houston d02",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm"
+    },
+    {
+        "City ID": "AUS001",
+        "Desc": "Austin d01",
+        "100-yr": "121 mm",
+        "50-yr": "106 mm",
+        "25-yr": "93 mm",
+        "10-yr": "76 mm"
+    },
+    {
+        "City ID": "AUS002",
+        "Desc": "Austin d02",
+        "100-yr": "121 mm",
+        "50-yr": "106 mm",
+        "25-yr": "93 mm",
+        "10-yr": "76 mm"
+    },
+    {
+        "City ID": "DAL001",
+        "Desc": "Dallas d01",
+        "100-yr": "94 mm",
+        "50-yr": "85 mm",
+        "25-yr": "76 mm",
+        "10-yr": "65 mm"
+    },
+    {
+        "City ID": "DAL002",
+        "Desc": "Dallas d02",
+        "100-yr": "94 mm",
+        "50-yr": "85 mm",
+        "25-yr": "76 mm",
+        "10-yr": "65 mm"
+    },
+    {
+        "City ID": "OKC001",
+        "Desc": "Oklahoma City d01",
+        "100-yr": "101 mm",
+        "50-yr": "89 mm",
+        "25-yr": "78 mm",
+        "10-yr": "64 mm"
+    },
+    {
+        "City ID": "OKC002",
+        "Desc": "Oklahoma City d02",
+        "100-yr": "101 mm",
+        "50-yr": "89 mm",
+        "25-yr": "78 mm",
+        "10-yr": "64 mm"
+    },
+    {
+        "City ID": "LA001",
+        "Desc": "Los Angeles d01",
+        "100-yr": "41 mm",
+        "50-yr": "36 mm",
+        "25-yr": "31 mm",
+        "10-yr": "25 mm"
+    },
+    {
+        "City ID": "LA002",
+        "Desc": "Los Angeles d02",
+        "100-yr": "41 mm",
+        "50-yr": "36 mm",
+        "25-yr": "31 mm",
+        "10-yr": "25 mm"
+    },
+    {
+        "City ID": "SF001",
+        "Desc": "San Francesco d01",
+        "100-yr": "33 mm",
+        "50-yr": "29 mm",
+        "25-yr": "26 mm",
+        "10-yr": "22 mm"
+    },
+    {
+        "City ID": "SF002",
+        "Desc": "San Francesco d01",
+        "100-yr": "33 mm",
+        "50-yr": "29 mm",
+        "25-yr": "26 mm",
+        "10-yr": "22 mm"
+    },
+    {
+        "City ID": "NYC001",
+        "Desc": "New York City (Manhattan downtown) d01",
+        "100-yr": "73 mm",
+        "50-yr": "65 mm",
+        "25-yr": "58 mm",
+        "10-yr": "48 mm"
+    },
+    {
+        "City ID": "NYC002",
+        "Desc": "New York City (Manhattan midtown) d02",
+        "100-yr": "73 mm",
+        "50-yr": "65 mm",
+        "25-yr": "58 mm",
+        "10-yr": "48 mm"
+    },
+    {
+        "City ID": "ATL001",
+        "Desc": "Atlanta d01",
+        "100-yr": "83 mm",
+        "50-yr": "74 mm",
+        "25-yr": "65 mm",
+        "10-yr": "54 mm"
+    },
+    {
+        "City ID": "ATL002",
+        "Desc": "Atlanta d02",
+        "100-yr": "83 mm",
+        "50-yr": "74 mm",
+        "25-yr": "65 mm",
+        "10-yr": "54 mm"
+    },
+    {
+        "City ID": "ORL001",
+        "Desc": "Orlando d01",
+        "100-yr": "100 mm",
+        "50-yr": "93 mm",
+        "25-yr": "85 mm",
+        "10-yr": "74 mm"
+    },
+    {
+        "City ID": "ORL002",
+        "Desc": "Orlando d02",
+        "100-yr": "100 mm",
+        "50-yr": "93 mm",
+        "25-yr": "85 mm",
+        "10-yr": "74 mm"
+    },
+    {
+        "City ID": "MIA001",
+        "Desc": "Miami   d01",
+        "100-yr": "133 mm",
+        "50-yr": "118 mm",
+        "25-yr": "104 mm",
+        "10-yr": "86 mm"
+    },
+    {
+        "City ID": "MIA002",
+        "Desc": "Miami   d02",
+        "100-yr": "133 mm",
+        "50-yr": "118 mm",
+        "25-yr": "104 mm",
+        "10-yr": "86 mm"
+    }
+]
