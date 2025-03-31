@@ -1,0 +1,42 @@
+defaults:
+  - _self_
+  
+# Data settings
+data:
+  data_dir: "data"
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  batch_size: 16
+  num_workers: 4
+  
+# Model settings
+model:
+  name: "swin_transformer"
+  img_size: 224
+  patch_size: 4
+  in_channels: 2  # Rainfall and DEM
+  embed_dim: 96
+  depths: [2, 2, 6, 2]
+  num_heads: [3, 6, 12, 24]
+  window_size: 7
+  mlp_ratio: 4.0
+  drop_rate: 0.1
+  attn_drop_rate: 0.0
+  drop_path_rate: 0.1
+  
+# Training settings
+training:
+  max_epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.05
+  lr_scheduler: "cosine"
+  warmup_epochs: 5
+  
+# Logging settings
+logging:
+  project_name: "flood-risk-prediction"
+  log_every_n_steps: 50
+  save_top_k: 3
+  monitor: "val_loss"
+  mode: "min" 
