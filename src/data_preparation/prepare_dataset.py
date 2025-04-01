@@ -20,7 +20,7 @@ def load_city_rainfall_data(json_file):
     """
     with open(json_file, 'r') as f:
         rainfall_data = json.load(f)
-    
+
     # Create a dictionary mapping city ID to rainfall values
     city_rainfall = {}
     for city in rainfall_data:
@@ -68,6 +68,7 @@ def extract_max_flood_depth(dataset_path, city_id, rainfall_type):
         
         # Skip if file doesn't exist
         if not os.path.exists(flood_path):
+            print(flood_path)
             continue
         
         # Read the flood depth data
@@ -118,7 +119,7 @@ def create_h5_dataset(dataset_path, output_path, city_rainfall_file, test_cities
     city_rainfall = load_city_rainfall_data(city_rainfall_file)
     
     # Get all city IDs from the dataset directory
-    all_cities = [d for d in os.listdir(dataset_path) if os.path.isdir(os.path.join(dataset_path, d))]
+    all_cities = list(city_rainfall.keys())
     
     # Filter out test cities
     if test_cities is None:
@@ -153,52 +154,45 @@ def create_h5_dataset(dataset_path, output_path, city_rainfall_file, test_cities
         
         for cities, group in city_groups:
             for city_id in tqdm(cities, desc=f"Processing {group.name} cities"):
-                if city_id not in city_rainfall:
-                    print(f"Warning: Rainfall data for {city_id} not found in JSON file. Skipping.")
-                    continue
                 
                 # Create a group for this city
                 city_group = group.create_group(city_id)
                 
-                # Load DEM
-                try:
-                    dem_data = load_dem(dataset_path, city_id)
-                    city_group.create_dataset('dem', data=dem_data, compression='gzip')
-                except Exception as e:
-                    print(f"Error loading DEM for {city_id}: {e}")
-                    continue
+
+                dem_data = load_dem(dataset_path, city_id)
+                city_group.create_dataset('dem', data=dem_data, compression='gzip')
+
                 
                 # Process each rainfall type
                 for rainfall_type in ['100-yr', '50-yr', '25-yr', '10-yr']:
-                    try:
-                        # Extract max flood depth
-                        max_depth = extract_max_flood_depth(dataset_path, city_id, rainfall_type)
+                    rain_value_str= f'{int(city_rainfall[city_id][rainfall_type])}mm'
+                    # Extract max flood depth
+                    max_depth = extract_max_flood_depth(dataset_path, city_id, rain_value_str)
+                    
+                    if max_depth is None:
+                        print(f"Warning: No flood data found for {city_id}, {rainfall_type}")
+                        continue
+                    
+                    # Create a group for this rainfall type
+                    rainfall_group = city_group.create_group(rainfall_type)
+                    
+                    # Store rainfall value
+                    rainfall_value = city_rainfall[city_id][rainfall_type]
+                    rainfall_group.attrs['rainfall_value'] = rainfall_value
+                    
+                    # Store max flood depth
+                    rainfall_group.create_dataset('max_flood_depth', data=max_depth, compression='gzip')
                         
-                        if max_depth is None:
-                            print(f"Warning: No flood data found for {city_id}, {rainfall_type}")
-                            continue
-                        
-                        # Create a group for this rainfall type
-                        rainfall_group = city_group.create_group(rainfall_type)
-                        
-                        # Store rainfall value
-                        rainfall_value = city_rainfall[city_id][rainfall_type]
-                        rainfall_group.attrs['rainfall_value'] = rainfall_value
-                        
-                        # Store max flood depth
-                        rainfall_group.create_dataset('max_flood_depth', data=max_depth, compression='gzip')
-                        
-                    except Exception as e:
-                        print(f"Error processing {city_id}, {rainfall_type}: {e}")
+
 
 def main():
     # Define paths
-    dataset_path = 'dataset'  # Path to the dataset directory
+    dataset_path = '/home/users/li1995/global_flood/UrbanFloods2D/dataset'  # Path to the dataset directory
     output_path = 'flood_data.h5'  # Path where the H5 file will be saved
-    city_rainfall_file = 'src/cities_rainfall.json'  # Path to the JSON file
+    city_rainfall_file = '../cities_rainfall.json'  # Path to the JSON file
     
     # Define test cities (you can change this)
-    test_cities = ['HOU001', 'LA001', 'NYC001']
+    test_cities = ['HOU007', 'LA002', 'NYC002']
     
     # Create H5 dataset
     create_h5_dataset(dataset_path, output_path, city_rainfall_file, test_cities)

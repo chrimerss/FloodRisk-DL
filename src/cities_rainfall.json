@@ -16,6 +16,46 @@
         "10-yr": "82 mm"
     },
     {
+        "City ID": "HOU003",
+        "Desc": "Houston d03",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm"
+    },
+    {
+        "City ID": "HOU004",
+        "Desc": "Houston d04",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm"
+    },
+    {
+        "City ID": "HOU005",
+        "Desc": "Houston d05",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm"
+    },    
+    {
+        "City ID": "HOU006",
+        "Desc": "Houston d06",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm"
+    },    
+    {
+        "City ID": "HOU007",
+        "Desc": "Houston d07",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm"
+    },    
+    {
         "City ID": "AUS001",
         "Desc": "Austin d01",
         "100-yr": "121 mm",
