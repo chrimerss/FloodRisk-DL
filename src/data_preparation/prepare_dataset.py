@@ -1,414 +1,333 @@
-import os
-import json
-import numpy as np
+import xarray as xr
 import rasterio
+import numpy as np
+import os
+from rasterio.windows import Window
+from glob import glob
+import json
+from rasterio.transform import from_origin
+from rtree import index  # For the spatial index
+from scipy.spatial import cKDTree
+from pyproj import CRS, Transformer  # For reprojection
 import h5py
-from tqdm import tqdm
-import glob
-import random
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import partial
-import multiprocessing
 
-# Define HALO size for boundary handling
-HALO = 10
-OVERLAY=500
+BUFFER = 10
+rgb_to_class = {
+    (255, 0, 0): 1,  # Red - building
+    (133, 133, 133): 2,  # Gray - road
+    (255, 0, 192): 3,  # Purple - parking lot
+    (34, 139, 34): 4,  # Dark green - tree canopy
+    (128, 236, 104): 5,  # Light green - grass/shrub
+    (0, 0, 255): 6,  # Blue - water
+    (255, 193, 37): 7,  # Yellow - agriculture
+    (128, 0, 0): 8,  # Dark red - barren
+    (255, 255, 255): 9,  # White - others
+}
 
-def load_city_rainfall_data(json_file):
-    """
-    Load the rainfall data from the JSON file.
+# Convert dictionary to a structured NumPy array for fast lookup
+rgb_keys = np.array(list(rgb_to_class.keys()), dtype=np.uint8)
+class_values = np.array(list(rgb_to_class.values()), dtype=np.uint8)
+H5= h5py.File('flood_data.h5', 'a')
+if 'train' not in H5.keys():
+    train= H5.create_group('train')
+    test= H5.create_group('test')
+    val= H5.create_group('val')
+else:
+    train= H5['train']
+    test= H5['test']
+    val = H5['val']
+
+def map_rgb_to_class(ds2):
+    """Maps an RGB image in xarray format to discrete classes."""
+    # Ensure ds2 has correct dimensions
+    if 'band' not in ds2.dims or 'y' not in ds2.dims or 'x' not in ds2.dims:
+        raise ValueError(f"Expected dimensions ('band', 'y', 'x'), but got {ds2.dims}")
+
+    # Extract RGB bands safely
+    r, g, b = ds2.sel(band=1)['band_data'], ds2.sel(band=2)['band_data'], ds2.sel(band=3)['band_data']
+
+    # Stack into (height, width, 3)
+    rgb_array = np.stack([r.values, g.values, b.values], axis=-1)
+
+    # Ensure data type compatibility
+    rgb_array = rgb_array.astype(np.uint8)  
+
+    # Create an empty array for class labels
+    class_array = np.zeros((ds2.sizes['y'], ds2.sizes['x']), dtype=np.uint8)  
+
+    # Vectorized mapping
+    for rgb, class_label in rgb_to_class.items():
+        mask = np.all(rgb_array == np.array(rgb, dtype=np.uint8), axis=-1)
+        class_array[mask] = class_label  
+
+    # Convert to xarray DataArray
+    class_map = xr.DataArray(class_array, coords={'y': ds2.y, 'x': ds2.x}, dims=('y', 'x'))
+
+    return class_map
+
+# Apply function to ds2
+# ds2_classified = map_rgb_to_class(ds2)
+
+def create_geotiff_index(geotiff_paths, target_crs="EPSG:4326"):  # Default to WGS84
+    """Creates a spatial index of GeoTIFF boundaries, reprojecting to target_crs."""
+    idx = index.Index()
+    geotiff_data = {}
+
+    for i, geotiff_path in enumerate(geotiff_paths):
+        with rasterio.open(geotiff_path) as src:
+            # Get source CRS
+            source_crs = src.crs
+
+            # Create transformer (only once per GeoTIFF)
+            transformer = Transformer.from_crs(source_crs, target_crs, always_xy=True) # Always xy=True ensures lon, lat order
+
+            # Get the bounds of the GeoTIFF in source CRS
+            left, bottom, right, top = src.bounds
+
+            # Reproject bounds to target CRS
+            reprojected_left, reprojected_bottom = transformer.transform(left, bottom)
+            reprojected_right, reprojected_top = transformer.transform(right, top)
+
+            # print(f"Reprojected bounds: {reprojected_left}, {reprojected_bottom}, {reprojected_right}, {reprojected_top}")
+
+            # Insert reprojected bounds into the index
+            idx.insert(i, (reprojected_left, reprojected_bottom, reprojected_right, reprojected_top))
+            geotiff_data[i] = {"path": geotiff_path, "transform": src.transform, "height": src.height, "width": src.width, "source_crs": source_crs}
+
+
+    return idx, geotiff_data
+
+def get_value_from_geotiffs_indexed(idx, geotiff_data, ref_file):
+    """Retrieves value using the spatial index."""
+    # Query the index for intersecting GeoTIFFs
+    target_crs="EPSG:4326"
+    ds= xr.open_dataset(ref_file)['band_data']
+    lonmin= ds.x.values.min()
+    lonmax= ds.x.values.max()
+    latmin= ds.y.values.min()
+    latmax= ds.y.values.max()
+    # print(geotiff_data[62])
+    if len(list(idx.intersection((lonmin, latmin, lonmax, latmax))))>1:
+        # return None
+        ds2= xr.combine_by_coords([xr.open_dataset(geotiff_data[i]['path']) for i in idx.intersection((lonmin, latmin, lonmax, latmax))]).rio.reproject(ds.rio.crs)
+    else:
+        ds2= xr.open_dataset(geotiff_data[list(idx.intersection((lonmin, latmin, lonmax, latmax)))[0]]['path']).rio.reproject(ds.rio.crs)
+    # print(ds.dims, ds2.dims)
+    ds2_classified= map_rgb_to_class(ds2)
+    ds2_resampled = ds2_classified.interp(x=ds.x, y=ds.y, method="nearest")
+    return ds2_resampled
+
+
+def make_lulc(input_dir, output_dir, ref_file):
+    paths= sorted(glob("../dataset/HOU_LULC/HOU*.tif"))
+    idx, geotiff_path = create_geotiff_index(paths)
+    ds= get_value_from_geotiffs_indexed(idx, geotiff_path, ref_file)
+    ds.squeeze().rio.to_raster(os.path.join(output_dir, f"{input_dir.split('/')[-1]}_LULC.tif"))
     
-    Args:
-        json_file (str): Path to the JSON file containing rainfall data
+
+
+def crop_geotiff_overlap(input_file, output_dir, crop_size=1024, overlap=100):
+    out_name = input_file.split("/")[-1].split(".")[0]
+    with rasterio.open(input_file) as src:
+        width = src.width
+        height = src.height
+        count = 1
+
+        for i in range(0, height - crop_size+1, crop_size - overlap):
+            for j in range(0, width - crop_size +1, crop_size - overlap):
+                window = Window(j, i, crop_size, crop_size)
+                transform = src.window_transform(window)
+                out_meta = src.meta.copy()
+                out_meta.update({
+                    "driver": "GTiff",
+                    "height": window.height,
+                    "width": window.width,
+                    "transform": transform
+                })
+
+                data = src.read(window=window).squeeze().astype(np.float32)
+
+                # Output original data
+                output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
+                with rasterio.open(output_file, "w", **out_meta) as dest:
+                    dest.write(data[np.newaxis, :, :])
+                count += 1
+
+                # # Flip upside down and output
+                flipped_ud = np.flipud(data)[np.newaxis, :, :]
+                output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
+                with rasterio.open(output_file, "w", **out_meta) as dest:
+                    dest.write(flipped_ud)
+                count += 1
+
+                # # Flip left to right and output
+                flipped_lr = np.fliplr(data)[np.newaxis, :, :]
+                output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
+                with rasterio.open(output_file, "w", **out_meta) as dest:
+                    dest.write(flipped_lr)
+                count += 1
+
+                #both flip upside down and left to right and output
+                flipped_up_lr = np.flipud(flipped_lr.squeeze())[np.newaxis, :, :]
+                output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
+                with rasterio.open(output_file, "w", **out_meta) as dest:
+                    dest.write(flipped_up_lr)
+                count += 1
+    print(f'{count} of tiles generated')
+
+def crop_geotiff_random(input_flood, input_dem, group, crop_size=1024, num_images=200, random_coords=None, min_distance=50):
+    """
+    Randomly crops an input GeoTIFF into multiple 1024x1024 images with flipping, ensuring coordinates are not too close.
+    Save training data to cropped_data with .npy
+    
+    Parameters:
+        input_file (str): Path to the input GeoTIFF file.
+        output_dir (str): Path to the output directory.
+        crop_size (int): Size of the cropped image (default: 1024).
+        num_images (int): Number of random crops to generate if random_coords is None (default: 200).
+        random_coords (list or None): List of coordinates [(i, j), ...] for cropping or None to generate randomly.
+        min_distance (int): Minimum allowable distance between two crop coordinates (default: 100).
+
+    Return:
+        random_coords (list): Randomply generated coordinates to be passed as input so repeatable
+    """
+    out_name = input_file.split("/")[-1].split(".")[0]
+    rainfall= int(input_file.split('_')[2].split('m')[0])
+
+    with rasterio.open(input_file) as src:
+        width = src.width
+        height = src.height
+        print(f'width: {width}, height: {height}')
+        count = 1
         
-    Returns:
-        dict: Dictionary mapping city IDs to rainfall values
-    """
-    with open(json_file, 'r') as f:
-        rainfall_data = json.load(f)
-
-    # Create a dictionary mapping city ID to rainfall values
-    city_rainfall = {}
-    for city in rainfall_data:
-        city_id = city['City ID']
-        # Convert rainfall values from string to float (remove 'mm' and convert)
-        rainfall_values = {
-            '100-yr': float(city['100-yr'].split('m')[0]),
-            '50-yr': float(city['50-yr'].split('m')[0]),
-            '25-yr': float(city['25-yr'].split('m')[0]),
-            '10-yr': float(city['10-yr'].split('m')[0])
-        }
-        city_rainfall[city_id] = rainfall_values
-    
-    return city_rainfall
-
-def get_timesteps():
-    """
-    Generate the timestep strings used in the filenames.
-    
-    Returns:
-        list: List of timestep strings
-    """
-    return [f"{t:07d}" for t in range(0, 2160000 + 1, 30000) if t != 0]
-
-def apply_halo_boundary(data):
-    """
-    Apply HALO boundary by slicing the array to remove edge effects.
-    
-    Args:
-        data (numpy.ndarray): Input array
+        # Generate random coordinates if not provided
+        if random_coords is None:
+            random_coords = []
+            while len(random_coords) < num_images:
+                i = np.random.randint(BUFFER, height - crop_size-BUFFER)
+                j = np.random.randint(BUFFER, width - crop_size-BUFFER)
+                # Check if the new coordinate is far enough from all existing coordinates
+                if all(np.sqrt((i - x) ** 2 + (j - y) ** 2) >= min_distance for x, y in random_coords):
+                    random_coords.append((i, j))
         
-    Returns:
-        numpy.ndarray: Array with HALO boundary removed
-    """
-    return data[HALO:-HALO, HALO:-HALO]
-
-def create_tiles(data, tile_size=1024, overlap=OVERLAY):
-    """
-    Create overlapping tiles from a large array.
-    
-    Args:
-        data (numpy.ndarray): Input array to tile
-        tile_size (int): Size of each tile
-        overlap (int): Number of pixels to overlap between tiles
+        for i, j in random_coords:
+            window = Window(j, i, crop_size, crop_size)
+            transform = src.window_transform(window)
+            out_meta = src.meta.copy()
+            out_meta.update({
+                "driver": "GTiff",
+                "height": window.height,
+                "width": window.width,
+                "transform": transform
+            })
         
-    Returns:
-        list: List of (tile, start_h, start_w) tuples
-    """
-    h, w = data.shape
-    tiles = []
-    
-    # Calculate stride (distance between tile centers)
-    stride = tile_size - overlap
-    
-    # Create tiles
-    for h_start in range(0, h, stride):
-        for w_start in range(0, w, stride):
-            # Calculate tile boundaries
-            h_end = min(h_start + tile_size, h)
-            w_end = min(w_start + tile_size, w)
-            
-            # Extract tile
-            tile = data[h_start:h_end, w_start:w_end]
-            
-            # Pad if necessary
-            if tile.shape != (tile_size, tile_size):
-                padded_tile = np.zeros((tile_size, tile_size), dtype=data.dtype)
-                padded_tile[:tile.shape[0], :tile.shape[1]] = tile
-                tile = padded_tile
-            
-            tiles.append((tile, h_start, w_start))
-    
-    return tiles
+            data = src.read(window=window).squeeze().astype(np.float32)
+            with rasterio.open(dem_input) as f:
+                dem= f.read(window=window).squeeze().astype(np.float32)
+            arr_rain= np.ones(data.shape) * rainfall
+            data= np.stack([data, arr_rain, dem])
+            assert data.shape==(3,1024,1024), f'it has non valid values, {input_file}, its shape is {data.shape}'
 
-def process_tile(args):
-    """
-    Process a single tile of data.
-    
-    Args:
-        args (tuple): Tuple containing (tile_data, tile_info, rainfall_value)
-        
-    Returns:
-        tuple: (tile_data, tile_info, rainfall_value)
-    """
-    tile_data, tile_info, rainfall_value = args
-    return tile_data, tile_info, rainfall_value
-
-def process_timestep(args):
-    """
-    Process a single timestep of flood depth data.
-    
-    Args:
-        args (tuple): Tuple containing (flood_path, ts)
-        
-    Returns:
-        tuple: (ts, flood_data) or None if file doesn't exist
-    """
-    flood_path, ts = args
-    if not os.path.exists(flood_path):
-        return None
-    
-    with rasterio.open(flood_path) as src:
-        flood_data = src.read(1)  # Read the first band
-    return ts, flood_data
-
-def extract_max_flood_depth(dataset_path, city_id, rainfall_type):
-    """
-    Extract the maximum flood depth across all time steps for a specific city and rainfall.
-    
-    Args:
-        dataset_path (str): Path to the dataset directory
-        city_id (str): City ID
-        rainfall_type (str): Type of rainfall (e.g., '100-yr')
-        
-    Returns:
-        numpy.ndarray: Maximum flood depth array
-    """
-    city_dir = os.path.join(dataset_path, city_id)
-    timesteps = get_timesteps()
-    
-    # Create arguments for parallel processing
-    args = []
-    for ts in timesteps:
-        flood_filename = f"{city_id}_{rainfall_type}_WaterDepth_{ts}.tif"
-        flood_path = os.path.join(city_dir, flood_filename)
-        args.append((flood_path, ts))
-    
-    # Process timesteps in parallel
-    num_workers = multiprocessing.cpu_count()
-    max_flood_depth = None
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_timestep, arg) for arg in args]
-        for future in as_completed(futures):
-            # try:
-            result = future.result()
-            if result is None:
-                continue
-                
-            ts, flood_data = result
-            
-            # Initialize max_flood_depth if this is the first valid timestep
-            if max_flood_depth is None:
-                max_flood_depth = flood_data
+            # Output original data
+            city_rainfall= '_'.join(out_name.split('_')[:2])
+            if city_rainfall not in group.keys():
+                subgroup= group.create_group(city_rainfall)
             else:
-                # Update maximum values
-                max_flood_depth = np.maximum(max_flood_depth, flood_data)
-            # except Exception as e:
-            #     print(f"Error processing timestep for {city_id}, {rainfall_type}: {e}")
-    
-    # Apply HALO boundary to the maximum flood depth
-    if max_flood_depth is not None:
-        max_flood_depth = apply_halo_boundary(max_flood_depth)
-    
-    return max_flood_depth
-
-def load_dem(dataset_path, city_id):
-    """
-    Load the DEM data for a specific city.
-    
-    Args:
-        dataset_path (str): Path to the dataset directory
-        city_id (str): City ID
-        
-    Returns:
-        numpy.ndarray: DEM data
-    """
-    city_dir = os.path.join(dataset_path, city_id)
-    dem_filename = f"{city_id}_DEM.tif"
-    dem_path = os.path.join(city_dir, dem_filename)
-    
-    with rasterio.open(dem_path) as src:
-        dem_data = src.read(1)  # Read the first band
-    
-    # Apply HALO boundary to the DEM
-    dem_data = apply_halo_boundary(dem_data)
-    
-    return dem_data
-
-def read_flood_depth_files(args):
-    """
-    Read all flood depth files for a specific city and rainfall type.
-    
-    Args:
-        args (tuple): Tuple containing (city_dir, city_id, rainfall_type)
-        
-    Returns:
-        tuple: (city_id, rainfall_type, flood_data_list) or None if error
-    """
-    city_dir, city_id, rainfall_type = args
-    timesteps = get_timesteps()
-    flood_data_list = []
-    
-    # try:
-    for ts in timesteps:
-        flood_filename = f"{city_id}_{rainfall_type}_WaterDepth_{ts}.tif"
-        flood_path = os.path.join(city_dir, flood_filename)
-        
-        if not os.path.exists(flood_path):
-            continue
+                subgroup= group[city_rainfall]
+            # output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
             
-        with rasterio.open(flood_path) as src:
-            flood_data = src.read(1)  # Read the first band
-            flood_data_list.append(flood_data)
-    
-    if not flood_data_list:
-        print(f"Warning: No flood data found for {city_id}, {rainfall_type}")
-        return None
-        
-    # Calculate maximum flood depth across all timesteps
-    max_flood_depth = np.maximum.reduce(flood_data_list)
-    
-    # Apply HALO boundary
-    max_flood_depth = apply_halo_boundary(max_flood_depth)
-    
-    return city_id, max_flood_depth
-        
-    # except Exception as e:
-    #     print(f"Error reading flood depth files for {city_id}, {rainfall_type}: {e}")
-    #     return None
+            subgroup.create_dataset(f"{count:04d}", data=data, compression='gzip')
+            # np.save(output_file, data)
+            # with rasterio.open(output_file, "w", **out_meta) as dest:
+            #     dest.write(data[np.newaxis, :, :])
+            count += 1
 
-def process_city_data(args):
-    """
-    Process a single city's data without H5 writing.
-    
-    Args:
-        args (tuple): Tuple containing (city_id, dataset_path, city_rainfall)
-        
-    Returns:
-        tuple: (city_id, dem_tiles, flood_tiles_dict)
-    """
-    city_id, dataset_path, city_rainfall = args
-    city_dir = os.path.join(dataset_path, city_id)
-    
-    # Load and process DEM data
-    dem_data = load_dem(dataset_path, city_id)
-    dem_tiles = create_tiles(dem_data)
-    
-    # Process each rainfall type in parallel
-    flood_tiles_dict = {}
-    rainfall_types = ['100-yr', '50-yr', '25-yr', '10-yr']
-    
-    # Create arguments for parallel processing
-    process_args = []
-    for rainfall_type in rainfall_types:
-        rain_value_str = f'{int(city_rainfall[city_id][rainfall_type])}mm'
-        process_args.append((city_dir, city_id, rain_value_str))
-    
-    # Process rainfall types in parallel
-    num_workers = multiprocessing.cpu_count()
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(read_flood_depth_files, arg) for arg in process_args]
-        for future in as_completed(futures):
-            # try:
-            result = future.result()
-            if result is None:
-                continue
-                
-            city_id, max_depth = result
+            # Flip upside down and output
+            flipped_ud = data[:,::-1,:]
+            subgroup.create_dataset(f"{count:04d}", data=flipped_ud, compression='gzip')
+            # output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
+            # with rasterio.open(output_file, "w", **out_meta) as dest:
+            #     dest.write(flipped_ud)
+            # np.save(output_file, flipped_ud)
+            count += 1
+            # Flip left to right and output
+            flipped_lr = data[:,:,::-1]
+            subgroup.create_dataset(f"{count:04d}", data=flipped_lr, compression='gzip')
+            # output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
             
-            # Create tiles for flood depth
-            flood_tiles = create_tiles(max_depth)
-            flood_tiles_dict[rainfall_type] = {
-                'tiles': flood_tiles,
-                'rainfall_value': city_rainfall[city_id][rainfall_type]
-            }
-            # except Exception as e:
-            #     print(f"Error processing rainfall type for {city_id}: {e}")
-    
-    return city_id, dem_tiles, flood_tiles_dict
+            # with rasterio.open(output_file, "w", **out_meta) as dest:
+            #     dest.write(flipped_lr)
+            # np.save(output_file, flipped_lr)
+            count += 1
 
-def create_h5_dataset(dataset_path, output_path, city_rainfall_file, test_cities=None, val_ratio=0.1):
-    """
-    Create an H5 dataset containing the DEM and maximum flood depth for each city and rainfall level.
-    
-    Args:
-        dataset_path (str): Path to the dataset directory
-        output_path (str): Path where the H5 file will be saved
-        city_rainfall_file (str): Path to the JSON file containing rainfall data
-        test_cities (list): List of city IDs to be used for testing
-        val_ratio (float): Ratio of validation data
-    """
-    # Load rainfall data
-    city_rainfall = load_city_rainfall_data(city_rainfall_file)
-    
-    # Get all city IDs from the dataset directory
-    all_cities = list(city_rainfall.keys())
-    
-    # Filter out test cities
-    if test_cities is None:
-        test_cities = []
-    
-    train_val_cities = [city for city in all_cities if city not in test_cities]
-    
-    # Split into train and validation sets
-    random.seed(42)  # For reproducibility
-    random.shuffle(train_val_cities)
-    val_size = max(1, int(len(train_val_cities) * val_ratio))
-    val_cities = train_val_cities[:val_size]
-    train_cities = train_val_cities[val_size:]
-    
-    print(f"Train cities: {train_cities}")
-    print(f"Validation cities: {val_cities}")
-    print(f"Test cities: {test_cities}")
-    
-    # Process cities sequentially
-    city_results = {}
-    for city_id in tqdm(train_cities + val_cities + test_cities, desc="Processing cities"):
-        # try:
-        city_id, dem_tiles, flood_tiles_dict = process_city_data((city_id, dataset_path, city_rainfall))
-        city_results[city_id] = (dem_tiles, flood_tiles_dict)
-        # except Exception as e:
-        #     print(f"Error processing city: {e}")
-    
-    # Write results to H5 file
-    print("Writing results to H5 file...")
-    with h5py.File(output_path, 'w') as h5f:
-        # Create groups for train, val, and test
-        train_group = h5f.create_group('train')
-        val_group = h5f.create_group('val')
-        test_group = h5f.create_group('test')
-        
-        # Write results for each city
-        for city_id, (dem_tiles, flood_tiles_dict) in city_results.items():
-            # Determine which group to write to
-            if city_id in train_cities:
-                group = train_group
-            elif city_id in val_cities:
-                group = val_group
-            else:
-                group = test_group
+            # Both flip upside down and left to right and output
+            flipped_up_lr = data[:,::-1,::-1]
+            # output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
+            subgroup.create_dataset(f"{count:04d}", data= flipped_up_lr, compression='gzip')
+
+            count += 1
             
-            # Write data for each rainfall type
-            for rainfall_type, data in flood_tiles_dict.items():
-                # Create subgroup for city and rainfall level
-                subgroup_name = f"{city_id}_{rainfall_type}"
-                subgroup = group.create_group(subgroup_name)
-                
-                # Store rainfall value as attribute
-                subgroup.attrs['rainfall_value'] = data['rainfall_value']
-                
-                # Write tiles
-                for i, (dem_tile, dem_h_start, dem_w_start) in enumerate(dem_tiles, start=1):
-                    # Get corresponding flood depth tile
-                    flood_tile, flood_h_start, flood_w_start = data['tiles'][i-1]
-                    
-                    # Create combined dataset (2, 1024, 1024)
-                    combined_data = np.stack([dem_tile, flood_tile], axis=0)
-                    subgroup.create_dataset(f'tile_{i:06d}', data=combined_data, compression='gzip')
-                    
-                    # Store tile position info
-                    subgroup.create_dataset(f'tile_info_{i:06d}', 
-                                         data=(dem_h_start, dem_w_start, flood_h_start, flood_w_start),
-                                         compression='gzip')
-                
-                # Store number of tiles
-                subgroup.attrs['num_tiles'] = len(dem_tiles)
-        
-        # Store number of cities in each split
-        train_group.attrs['num_cities'] = len(train_cities)
-        val_group.attrs['num_cities'] = len(val_cities)
-        test_group.attrs['num_cities'] = len(test_cities)
-        
-        print(f"Dataset created with:")
-        print(f"Train cities: {len(train_cities)}")
-        print(f"Validation cities: {len(val_cities)}")
-        print(f"Test cities: {len(test_cities)}")
+    print(f"{count - 1} tiles generated and saved")
+    return random_coords  # Return the used coordinates for reproducibility
 
-def main():
-    # Define paths
-    dataset_path = '/home/users/li1995/global_flood/UrbanFloods2D/dataset'  # Path to the dataset directory
-    output_path = 'flood_data.h5'  # Path where the H5 file will be saved
-    city_rainfall_file = '../cities_rainfall.json'  # Path to the JSON file
-    
-    # Define test cities (you can change this)
-    test_cities = ['HOU007', 'LA002', 'NYC002']
-    
-    # Create H5 dataset
-    create_h5_dataset(dataset_path, output_path, city_rainfall_file, test_cities)
-    
-    print(f"Dataset created at {output_path}")
+def crop_maximum(input_dir, output_dir, rainfall_level=110):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    # given a input directory, find the maximum flood inundation depth and crop it
+    fnames= glob(f"{input_dir}/{input_dir.split('/')[-1].split('_')[0]}_{rainfall_level}*.tif")
+    ds= xr.concat([xr.open_dataset(f) for f in fnames], dim='band_value').load()
+    max_depth = ds.max(dim='band_value')
+    # print(max_depth)
+    max_depth.squeeze().rio.to_raster(os.path.join(output_dir, f"{input_dir.split('/')[-1]}_{rainfall_level}_max.tif"))
+
 
 if __name__ == "__main__":
-    main() 
+    with open("cities_rainfall.json", "r") as f:
+        data = json.load(f)
+    train_data= ['HOU002', 'HOU003', 'HOU004', 'HOU005', 'HOU006',
+                 'AUS001','DAL001','OKC001','OKC002','LA001','SF001',
+                 'NYC001','ATL001','ATL002','ORL001','ORL002','MIA001']
+    test_data= ['HOU007', 'AUS002','SF002']
+    val_data= ['DAL002','LA002','NYC002','MIA002']
+    
+    
+    for city in data:
+        dataset = city['City ID']
+        output_dir = f"../cropped_data/{dataset}"
+        if dataset in train_data:
+            group=train
+        elif dataset in test_data:
+            group=test
+        else:
+            group=val
+
+        print(f'####### Processing {dataset} #######')
+
+        first = True
+        for rainfall_level in [city['100-yr'], city['50-yr'], city['25-yr'], city['10-yr']]:
+            rainfall_level = rainfall_level.replace(' ', '')
+            group_name= dataset + '_' +rainfall_level
+            if group_name in group.keys():
+                print(group_name, 'already exists! move on...')
+                continue
+            else:
+                input_dir = f'/home/users/li1995/global_flood/UrbanFloods2D/dataset/{dataset}'
+                dem_input = os.path.join(input_dir, f"{dataset}_DEM.tif")
+                input_file = f'/home/users/li1995/global_flood/UrbanFloods2D/sample/{dataset}_{rainfall_level}_max.tif'
+
+                # crop_maximum(input_dir, '/home/users/li1995/global_flood/UrbanFloods2D/sample', rainfall_level)
+                os.makedirs(output_dir, exist_ok=True)
+
+                if first:
+                    random_coords = crop_geotiff_random(input_file, dem_input, group)
+                    first = False
+                else:
+                    crop_geotiff_random(input_file, dem_input, group, random_coords=random_coords)
+
+        # make_lulc(input_dir, os.path.join('../sample'),input_file)
+        # lulc_input= f'../sample/{dataset}_LULC.tif'
+        # crop_geotiff_random(lulc_input, output_dir, random_coords=random_coords)
+        # crop_lulc(output_dir, coords=random_coords, ref_file= input_file)
+
+        
+        # crop_geotiff_random(dem_input, output_dir, random_coords=random_coords)

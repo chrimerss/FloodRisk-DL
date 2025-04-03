@@ -1,5 +1,11 @@
 *.h5
 *.png
+job.txt
+slurm*
+src/checkpoints/*
+src/outputs/*
+src/wandb/*
+.locks/*
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python

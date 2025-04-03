@@ -1,14 +1,14 @@
 import os
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 import pytorch_lightning as pl
+import torch
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 import wandb
 
-from models.swin_transformer import FloodPredictionModel
-from data.data_module import FloodDataModule
-from utils.visualization import log_to_wandb
+from models.flood_model import FloodPredictionModel
+from data.flood_data_module import FloodDataModule
 
 @hydra.main(version_base=None, config_path="../configs", config_name="model_config")
 def train(config: DictConfig) -> None:
@@ -18,15 +18,24 @@ def train(config: DictConfig) -> None:
     Args:
         config: Hydra configuration
     """
+    print(OmegaConf.to_yaml(config))
+
+    torch.set_float32_matmul_precision('high')
+    
     # Set up wandb logger
     wandb_logger = WandbLogger(
         project=config.logging.project_name,
-        name=f"swin_transformer_flood_prediction",
+        name=f"flood_prediction_{config.model.name}",
         log_model=True
     )
     
     # Initialize data module
-    data_module = FloodDataModule(config)
+    data_module = FloodDataModule(
+        h5_file=config.data.h5_file,
+        batch_size=config.data.batch_size,
+        num_workers=config.data.num_workers,
+        normalize=True
+    )
     
     # Initialize model
     model = FloodPredictionModel(config)
@@ -34,7 +43,7 @@ def train(config: DictConfig) -> None:
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
-        filename="{epoch}-{val_loss:.2f}",
+        filename="{epoch}-{val_loss:.4f}",
         save_top_k=config.logging.save_top_k,
         monitor=config.logging.monitor,
         mode=config.logging.mode
@@ -42,7 +51,7 @@ def train(config: DictConfig) -> None:
     
     early_stopping_callback = EarlyStopping(
         monitor=config.logging.monitor,
-        patience=10,
+        patience=15,
         mode=config.logging.mode
     )
     
@@ -52,9 +61,11 @@ def train(config: DictConfig) -> None:
     trainer = pl.Trainer(
         max_epochs=config.training.max_epochs,
         accelerator="auto",  # Use GPU if available
+        devices='auto',
         logger=wandb_logger,
         callbacks=[checkpoint_callback, early_stopping_callback, lr_monitor],
         log_every_n_steps=config.logging.log_every_n_steps,
+        deterministic=True,  # For reproducibility
     )
     
     # Train model
@@ -63,11 +74,8 @@ def train(config: DictConfig) -> None:
     # Test model
     trainer.test(model, data_module)
     
-    # Log sample predictions
-    log_to_wandb(trainer, model, data_module.val_dataloader(), num_samples=4)
-    
     # Close wandb
     wandb.finish()
 
 if __name__ == "__main__":
-    train()
+    train() 
