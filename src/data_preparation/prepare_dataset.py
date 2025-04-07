@@ -27,15 +27,7 @@ rgb_to_class = {
 # Convert dictionary to a structured NumPy array for fast lookup
 rgb_keys = np.array(list(rgb_to_class.keys()), dtype=np.uint8)
 class_values = np.array(list(rgb_to_class.values()), dtype=np.uint8)
-H5= h5py.File('flood_data.h5', 'a')
-if 'train' not in H5.keys():
-    train= H5.create_group('train')
-    test= H5.create_group('test')
-    val= H5.create_group('val')
-else:
-    train= H5['train']
-    test= H5['test']
-    val = H5['val']
+
 
 def map_rgb_to_class(ds2):
     """Maps an RGB image in xarray format to discrete classes."""
@@ -175,7 +167,7 @@ def crop_geotiff_overlap(input_file, output_dir, crop_size=1024, overlap=100):
                 count += 1
     print(f'{count} of tiles generated')
 
-def crop_geotiff_random(input_flood, input_dem, group, crop_size=1024, num_images=200, random_coords=None, min_distance=50):
+def crop_geotiff_random(input_flood, input_dem, group, crop_size=1024, num_images=100, random_coords=None, min_distance=50):
     """
     Randomly crops an input GeoTIFF into multiple 1024x1024 images with flipping, ensuring coordinates are not too close.
     Save training data to cropped_data with .npy
@@ -243,29 +235,29 @@ def crop_geotiff_random(input_flood, input_dem, group, crop_size=1024, num_image
             count += 1
 
             # Flip upside down and output
-            flipped_ud = data[:,::-1,:]
-            subgroup.create_dataset(f"{count:04d}", data=flipped_ud, compression='gzip')
+            # flipped_ud = data[:,::-1,:]
+            # subgroup.create_dataset(f"{count:04d}", data=flipped_ud, compression='gzip')
             # output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
             # with rasterio.open(output_file, "w", **out_meta) as dest:
             #     dest.write(flipped_ud)
             # np.save(output_file, flipped_ud)
-            count += 1
+            # count += 1
             # Flip left to right and output
-            flipped_lr = data[:,:,::-1]
-            subgroup.create_dataset(f"{count:04d}", data=flipped_lr, compression='gzip')
+            # flipped_lr = data[:,:,::-1]
+            # subgroup.create_dataset(f"{count:04d}", data=flipped_lr, compression='gzip')
             # output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
             
             # with rasterio.open(output_file, "w", **out_meta) as dest:
             #     dest.write(flipped_lr)
             # np.save(output_file, flipped_lr)
-            count += 1
+            # count += 1
 
             # Both flip upside down and left to right and output
-            flipped_up_lr = data[:,::-1,::-1]
+            # flipped_up_lr = data[:,::-1,::-1]
             # output_file = os.path.join(output_dir, f"{out_name}_{count:03d}.npy")
-            subgroup.create_dataset(f"{count:04d}", data= flipped_up_lr, compression='gzip')
+            # subgroup.create_dataset(f"{count:04d}", data= flipped_up_lr, compression='gzip')
 
-            count += 1
+            # count += 1
             
     print(f"{count - 1} tiles generated and saved")
     return random_coords  # Return the used coordinates for reproducibility
@@ -290,17 +282,26 @@ if __name__ == "__main__":
     test_data= ['HOU007', 'AUS002','SF002']
     val_data= ['DAL002','LA002','NYC002','MIA002']
     
-    
+    H5= h5py.File('flood_data.h5', 'a')
+    if 'train' not in H5.keys():
+        train= H5.create_group('train')
+        test= H5.create_group('test')
+        val= H5.create_group('val')
+    else:
+        train= H5['train']
+        test= H5['test']
+        val = H5['val']
+
     for city in data:
         dataset = city['City ID']
         output_dir = f"../cropped_data/{dataset}"
         if dataset in train_data:
-            group=train
+            H5= h5py.File('training.h5', 'a')
         elif dataset in test_data:
-            group=test
+            H5= h5py.File('testing.h5', 'a')
         else:
-            group=val
-
+            H5= h5py.File('validation.h5', 'a')
+        group= H5
         print(f'####### Processing {dataset} #######')
 
         first = True

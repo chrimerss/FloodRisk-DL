@@ -6,9 +6,16 @@ import torch
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 import wandb
+import torch.nn as nn
 
 from models.flood_model import FloodPredictionModel
 from data.flood_data_module import FloodDataModule
+
+def init_weights(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
 
 @hydra.main(version_base=None, config_path="../configs", config_name="model_config")
 def train(config: DictConfig) -> None:
@@ -25,20 +32,29 @@ def train(config: DictConfig) -> None:
     # Set up wandb logger
     wandb_logger = WandbLogger(
         project=config.logging.project_name,
-        name=f"flood_prediction_{config.model.name}",
+        name=f"lr-{config.training.learning_rate:.0e}_{config.model.num_layers}lys_{config.model.num_heads}heads_{config.model.window_size}ws",
         log_model=True
     )
     
     # Initialize data module
     data_module = FloodDataModule(
-        h5_file=config.data.h5_file,
+        data_dir=config.data.data_dir,
         batch_size=config.data.batch_size,
         num_workers=config.data.num_workers,
         normalize=True
     )
     
     # Initialize model
-    model = FloodPredictionModel(config)
+    
+    if config.training.checkpoint:
+        print('\n')
+        print(f'Loading pre-trained model: {config.training.checkpoint}')
+        print('\n')
+        model=FloodPredictionModel.load_from_checkpoint(config.training.checkpoint, config=config, strict=False)
+    else:
+        print('initializing model...')
+        model = FloodPredictionModel(config)
+        model.apply(init_weights)
     
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -60,10 +76,12 @@ def train(config: DictConfig) -> None:
     # Set up trainer
     trainer = pl.Trainer(
         max_epochs=config.training.max_epochs,
+        accumulate_grad_batches=config.training.accumulate_grad_batches,
         accelerator="auto",  # Use GPU if available
         devices='auto',
+        strategy='ddp',
         logger=wandb_logger,
-        callbacks=[checkpoint_callback, early_stopping_callback, lr_monitor],
+        callbacks=[checkpoint_callback, lr_monitor],
         log_every_n_steps=config.logging.log_every_n_steps,
         deterministic=True,  # For reproducibility
     )

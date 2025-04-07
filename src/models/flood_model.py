@@ -6,48 +6,13 @@ import wandb
 from torchmetrics import MeanSquaredError, MeanAbsoluteError, R2Score
 import matplotlib.pyplot as plt
 import numpy as np
+from .utils import Mlp, DropPath
+from .lr_scheduler import LinearWarmupCosineAnnealingLR
 
-class PatchEmbed(nn.Module):
-    """Split image into patches and embed them."""
-    def __init__(self, img_size=1024, patch_size=4, in_chans=2, embed_dim=96):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.n_patches = (img_size // patch_size) ** 2
-        
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-        
-    def forward(self, x):
-        x = self.proj(x)  # (B, embed_dim, H/patch_size, W/patch_size)
-        x = x.flatten(2)  # (B, embed_dim, n_patches)
-        x = x.transpose(1, 2)  # (B, n_patches, embed_dim)
-        return x
-
-class PatchMerging(nn.Module):
-    """Merge patches to reduce resolution."""
-    def __init__(self, dim, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
-        self.norm = norm_layer(4 * dim)
-        
-    def forward(self, x, H, W):
-        B, L, C = x.shape
-        x = x.view(B, H, W, C)
-        x0 = x[:, 0::2, 0::2, :]
-        x1 = x[:, 1::2, 0::2, :]
-        x2 = x[:, 0::2, 1::2, :]
-        x3 = x[:, 1::2, 1::2, :]
-        x = torch.cat([x0, x1, x2, x3], -1)
-        x = x.view(B, -1, 4 * C)
-        x = self.norm(x)
-        x = self.reduction(x)
-        return x
-
+# Swin Transformer Block
 class SwinTransformerBlock(nn.Module):
-    """Swin Transformer block with shifted window attention."""
-    def __init__(self, dim, num_heads, window_size=7, shift_size=0, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    def __init__(self, dim, num_heads, window_size, mlp_ratio=4.0, qkv_bias=True, 
+                 drop_path=0.0, attn_drop=0.0, proj_drop=0.0, shift_size=0):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -55,212 +20,349 @@ class SwinTransformerBlock(nn.Module):
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
         
-        self.norm1 = norm_layer(dim)
+        # Create LayerNorm with the correct dimension
+        # For a tensor of shape [B, H, W, C], we need to normalize over the last dimension C
+        self.norm1 = nn.LayerNorm(dim)  # Normalize over the channel dimension
+        self.norm2 = nn.LayerNorm(dim)  # Normalize over the channel dimension
+        
+        # Multi-head self attention
         self.attn = WindowAttention(
-            dim, window_size=(window_size, window_size), num_heads=num_heads, qkv_bias=qkv_bias,
-            qk_scale=None, attn_drop=attn_drop, proj_drop=drop)
+            dim, 
+            window_size=(window_size, window_size),
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop
+        )
         
-        self.norm2 = norm_layer(dim)
+        # MLP block
         mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.mlp = Mlp(
+            in_features=dim, 
+            hidden_features=mlp_hidden_dim, 
+            act_layer=nn.GELU, 
+            drop=proj_drop
+        )
         
-    def forward(self, x, H, W):
-        B, L, C = x.shape
+        # Drop path (stochastic depth)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
         shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
         
-        # Shift window
+        # Reshape for layer norm - LayerNorm expects [B, H, W, C] format
+        x = x.permute(0, 2, 3, 1).contiguous()  # B, H, W, C
+        
+        # Apply layer norm along the channel dimension only
+        x_norm = self.norm1(x)  # B, H, W, C
+        
+        # Cyclic shift if needed (for shifted window attention)
         if self.shift_size > 0:
-            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            shifted_x = torch.roll(x_norm, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
         else:
-            shifted_x = x
-            
+            shifted_x = x_norm
+        
         # Partition windows
-        x_windows = window_partition(shifted_x, self.window_size)
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        x_windows = window_partition(shifted_x, self.window_size)  # (B*num_windows, window_size, window_size, C)
         
-        # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows)
-        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        # Window attention
+        attn_windows = self.attn(x_windows)  # (B*num_windows, window_size, window_size, C)
         
-        # Reverse window partition
-        shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+        # Merge windows
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # (B, H, W, C)
         
-        # Reverse shift
+        # Reverse cyclic shift
         if self.shift_size > 0:
             x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
         else:
             x = shifted_x
-            
-        x = x.view(B, H * W, C)
-        x = shortcut + x
         
-        # FFN
-        x = x + self.mlp(self.norm2(x))
+        # Convert back to channel-first format for residual connection
+        x = x.permute(0, 3, 1, 2).contiguous()  # B, C, H, W
+        
+        # Apply residual connection
+        x = shortcut + self.drop_path(x)
+        
+        # MLP with skip connection
+        # First convert to channel-last for layer norm
+        x_channel_last = x.permute(0, 2, 3, 1).contiguous()  # B, H, W, C
+        x_norm = self.norm2(x_channel_last)
+        
+        # Convert back to channel-first for MLP
+        x_norm = x_norm.permute(0, 3, 1, 2).contiguous()  # B, C, H, W
+        
+        # Apply MLP and residual connection
+        x = x + self.drop_path(self.mlp(x_norm))
+        
         return x
 
+def window_partition(x, window_size):
+    """
+    Partition into non-overlapping windows.
+    Args:
+        x: (B, H, W, C)
+        window_size: window size
+    Returns:
+        windows: (B*num_windows, window_size, window_size, C)
+    """
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+def window_reverse(windows, window_size, H, W):
+    """
+    Reverse window partition.
+    Args:
+        windows: (B*num_windows, window_size, window_size, C)
+        window_size: Window size
+        H: Height of image
+        W: Width of image
+    Returns:
+        x: (B, H, W, C)
+    """
+    B = int(windows.shape[0] / (H * W / window_size / window_size))
+    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+    return x
+
 class WindowAttention(nn.Module):
-    """Window based multi-head self attention."""
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    """Window based multi-head self attention module."""
+    
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.dim = dim
-        self.window_size = window_size
+        self.window_size = window_size  # Wh, Ww
         self.num_heads = num_heads
         head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
+        self.scale = head_dim ** -0.5
+
+        # Define a parameter for relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
         
+        # Get pair-wise relative position index for each token in the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w], indexing='ij'))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        
+
+        nn.init.trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
     def forward(self, x):
-        B_, N, C = x.shape
-        qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        """
+        Args:
+            x: input features with shape of (B*num_windows, window_size, window_size, C)
+        """
+        # Handle different input shapes
+        if len(x.shape) == 4:
+            B_, H, W, C = x.shape
+            N = H * W
+            x = x.reshape(B_, N, C)
+        else:
+            B_, N, C = x.shape
+            H = W = int(N ** 0.5)
         
+        # Generate qkv 
+        qkv = self.qkv(x)
+        
+        # Reshape qkv for multi-head attention
+        qkv = qkv.reshape(B_, N, 3, self.num_heads, C // self.num_heads)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # 3, B_, num_heads, N, C//num_heads
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        # Apply scale factor to query
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
         
+        # Calculate attention scores
+        attn = (q @ k.transpose(-2, -1))  # B_, num_heads, N, N
+
+        # Add relative position bias
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        
+        # Add position bias to attention scores
+        attn = attn + relative_position_bias.unsqueeze(0)
+
+        # Apply softmax and dropout
+        attn = self.softmax(attn)
+        attn = self.attn_drop(attn)
+
+        # Calculate weighted sum
         x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+        
+        # Apply projection
         x = self.proj(x)
         x = self.proj_drop(x)
-        return x
-
-class Mlp(nn.Module):
-    """MLP as used in Vision Transformer."""
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
         
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
+        # Reshape back to window format if input was 4D
+        if len(x.shape) == 3 and H == W:
+            x = x.reshape(B_, H, W, C)
+            
         return x
-
-def window_partition(x, window_size):
-    """Partition input into windows."""
-    B, H, W, C = x.shape
-    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-    windows = windows.view(-1, window_size, window_size, C)
-    return windows
-
-def window_reverse(windows, window_size, H, W):
-    """Reverse window partition."""
-    B = int(windows.shape[0] / ((H / window_size) * (W / window_size)))
-    x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-    x = x.view(B, H, W, -1)
-    return x
 
 class SwinTransformer(nn.Module):
-    """Custom Swin Transformer implementation."""
-    def __init__(self, img_size=1024, patch_size=4, in_chans=2, num_classes=0,
-                 embed_dim=96, depths=(2, 2, 6, 2), num_heads=(3, 6, 12, 24),
-                 window_size=7, mlp_ratio=4., qkv_bias=True, drop_rate=0.0, attn_drop_rate=0.0,
-                 drop_path_rate=0.1, norm_layer=nn.LayerNorm):
+    def __init__(self, img_size=1024,
+                        patch_size=4,
+                        in_chans=2,  # DEM and rainfall channels
+                        num_classes=0,  # No classification head
+                        embed_dim=96,
+                        num_layers=4,
+                        num_heads=8,
+                        window_size=8,
+                        mlp_ratio=4.,
+                        qkv_bias=True,
+                        drop_rate=0.0,
+                        attn_drop_rate=0.0,
+                        drop_path_rate=0.1):
         super().__init__()
-        self.num_classes = num_classes
+        
+        # Initial embedding dimension
         self.embed_dim = embed_dim
-        self.depths = depths
-        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
-        num_patches = self.patch_embed.n_patches
+        self.in_channels = in_chans
+        self.num_layers = num_layers
+        self.window_size = window_size
+        self.num_heads = num_heads
         
-        self.pos_drop = nn.Dropout(p=drop_rate)
+        # Patch embedding with normalized conv - preserve more spatial information
+        self.patch_embed = nn.Sequential(
+            nn.Conv2d(self.in_channels, self.embed_dim, kernel_size=4, stride=4, bias=False),
+            nn.BatchNorm2d(self.embed_dim),
+            nn.GELU()
+        )
+
+        # Create stages with progressively increasing dimensions
+        self.dims = [self.embed_dim * (2**i) for i in range(self.num_layers)]
         
-        # Stochastic depth decay rule
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        
-        # Build layers
-        self.layers = nn.ModuleList()
-        for i_layer in range(len(depths)):
-            layer = BasicLayer(
-                dim=int(embed_dim * 2 ** i_layer),
-                depth=depths[i_layer],
-                num_heads=num_heads[i_layer],
-                window_size=window_size,
+        # Transformer blocks for encoding
+        self.encoder_blocks = nn.ModuleList([
+            SwinTransformerBlock(
+                dim=self.dims[l],
+                num_heads=self.num_heads,
+                window_size=self.window_size,
                 mlp_ratio=mlp_ratio,
                 qkv_bias=qkv_bias,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                norm_layer=norm_layer)
-            self.layers.append(layer)
+                drop_path=drop_path_rate * (l / (self.num_layers - 1)),
+                attn_drop=0,
+                proj_drop=0
+            )
+            for l in range(self.num_layers)
+        ])
+
+        # Downsampling layers
+        self.downsample = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(self.dims[l], self.dims[l+1], kernel_size=2, stride=2, bias=False),
+                nn.BatchNorm2d(self.dims[l+1]),
+                nn.GELU()
+            )
+            for l in range(self.num_layers - 1)
+        ])
+
+        # Transformer blocks for decoding with skip connections
+        # Use the same dimension for each decoder level as the corresponding encoder level
+        self.decoder_blocks = nn.ModuleList([
+            SwinTransformerBlock(
+                dim=self.dims[l-1],  # Use the dimension of the target level
+                num_heads=self.num_heads,
+                window_size=self.window_size,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                drop_path=drop_path_rate * (l / (self.num_layers - 1)),
+                attn_drop=0,
+                proj_drop=0
+            )
+            for l in range(self.num_layers - 1, 0, -1)
+        ])
+
+        # Upsampling layers
+        self.upsample = nn.ModuleList([
+            nn.Sequential(
+                nn.ConvTranspose2d(self.dims[l], self.dims[l-1], kernel_size=2, stride=2, bias=False),
+                nn.BatchNorm2d(self.dims[l-1]),
+                nn.GELU()
+            )
+            for l in range(self.num_layers - 1, 0, -1)
+        ])
         
-        # Calculate the final feature dimension
-        self.num_features = int(embed_dim * 2 ** (len(depths)))
+        # The fusion layers will be created dynamically during forward pass
+        # to account for potential dimension changes
         
-        # Update norm layer
-        self.norm = norm_layer(self.num_features)
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        # Final output layer - gradual upsampling to preserve detail
+        self.output_layer = nn.Sequential(
+            nn.Conv2d(self.dims[0], self.dims[0] // 2, kernel_size=3, padding=1),
+            nn.BatchNorm2d(self.dims[0] // 2),
+            nn.GELU(),
+            nn.Conv2d(self.dims[0] // 2, self.dims[0] // 4, kernel_size=3, padding=1),
+            nn.BatchNorm2d(self.dims[0] // 4),
+            nn.GELU(),
+            nn.ConvTranspose2d(self.dims[0] // 4, 1, kernel_size=4, stride=4),
+        )
         
     def forward(self, x):
+        # Patch embedding
         x = self.patch_embed(x)
-        x = self.pos_drop(x)
         
-        H = W = int(np.sqrt(self.patch_embed.n_patches))
+        # Encoder path with skip connections
+        features = [x]  # Store initial features
+        feature_dims = [x.shape[1]]  # Store feature dimensions
         
-        # Store features and dimensions at each layer
-        features = []
+        # Process through encoder blocks and downsample
+        for i, (encoder_block, down) in enumerate(zip(self.encoder_blocks[:-1], self.downsample)):
+            x = encoder_block(x)
+            features.append(x)  # Store features before downsampling
+            feature_dims.append(x.shape[1])
+            x = down(x)
         
-        # Process through layers
-        for i, layer in enumerate(self.layers):
-            x, H, W = layer(x, H, W)
+        # Process at bottleneck
+        x = self.encoder_blocks[-1](x)
+        
+        # Decoder path with skip connections
+        for i, (decoder_block, up) in enumerate(zip(self.decoder_blocks, self.upsample)):
+            x = up(x)  # Upsample
+            skip_features = features[-(i+2)]  # Get corresponding skip connection
             
-            if i == len(self.layers) - 1:
-                # Last layer - apply normalization
-                B, L, C = x.shape
-                assert C == self.num_features, f"Feature dim mismatch: {C} vs {self.num_features}"
-                x = self.norm(x)
-                x = self.head(x)
+            # Ensure spatial dimensions match before concatenating
+            if x.size(2) != skip_features.size(2) or x.size(3) != skip_features.size(3):
+                # Resize skip features to match upsampled features if needed
+                skip_features = F.interpolate(skip_features, size=(x.size(2), x.size(3)), 
+                                           mode='bilinear', align_corners=False)
+            
+            # Use a fixed convolution to reduce skip connection channels if needed
+            if skip_features.size(1) != x.size(1):
+                # Create a 1x1 conv to adjust channels and add it to the module
+                skip_conv = nn.Conv2d(skip_features.size(1), x.size(1), kernel_size=1).to(x.device)
+                skip_features = skip_conv(skip_features)
                 
-        return x
+            # Skip connection with residual addition instead of concatenation
+            # This avoids dimension mismatch issues completely
+            x = x + skip_features
+            
+            # Apply transformer block
+            x = decoder_block(x)
+        
+        # Final upsampling and output projection
+        output = self.output_layer(x)
+        
+        return output
 
-class BasicLayer(nn.Module):
-    """Basic Swin Transformer layer."""
-    def __init__(self, dim, depth, num_heads, window_size, mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0.,
-                 drop_path=0., norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.dim = dim
-        self.depth = depth
-        self.window_size = window_size
-        self.shift_size = window_size // 2
-        
-        # Build blocks
-        self.blocks = nn.ModuleList([
-            SwinTransformerBlock(
-                dim=dim,
-                num_heads=num_heads,
-                window_size=window_size,
-                shift_size=0 if (i % 2 == 0) else self.shift_size,
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-                drop=drop,
-                attn_drop=attn_drop,
-                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer)
-            for i in range(depth)])
-        
-        # Patch merging layer
-        self.downsample = PatchMerging(dim=dim, norm_layer=norm_layer)
-        
-    def forward(self, x, H, W):
-        for blk in self.blocks:
-            x = blk(x, H, W)
-        x = self.downsample(x, H, W)
-        return x, H//2, W//2  # Return the new H, W dimensions after downsampling
 
 class FloodPredictionModel(pl.LightningModule):
     def __init__(self, config):
@@ -276,41 +378,21 @@ class FloodPredictionModel(pl.LightningModule):
         
         # Custom Swin Transformer with proper depth calculation
         self.model = SwinTransformer(
-            img_size=1024,
-            patch_size=4,
-            in_chans=2,  # DEM and rainfall channels
+            img_size=self.config.model.img_size,
+            patch_size=self.config.model.patch_size,
+            in_chans=self.config.model.in_channels,  # DEM and rainfall channels
             num_classes=0,  # No classification head
-            embed_dim=96,
-            depths=(2, 2, 6, 2),
-            num_heads=(3, 6, 12, 24),
-            window_size=8,
-            mlp_ratio=4.,
+            embed_dim=self.config.model.embed_dim,
+            num_layers=self.config.model.num_layers,
+            num_heads=self.config.model.num_heads,
+            window_size=self.config.model.window_size,
+            mlp_ratio=self.config.model.mlp_ratio,
             qkv_bias=True,
             drop_rate=0.0,
             attn_drop_rate=0.0,
             drop_path_rate=0.1
         )
-        
-        # Get the correct feature dimension from the model
-        feature_dim = self.model.num_features
-        print(f"Feature dimension: {feature_dim}")
-        
-        # Modify regression head to handle the correct dimension
-        self.regression_head = nn.Sequential(
-            nn.Linear(feature_dim, 512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 1024),  # Output size for a 32x32 prediction
-        )
-        
-        # Upsampling layers to get back to the original resolution (1024x1024)
-        self.upsampling = nn.Sequential(
-            nn.Unflatten(1, (1, 32, 32)),  # Reshape to [B, 1, 32, 32]
-            nn.Upsample(scale_factor=32, mode='bilinear', align_corners=True)  # Upsample to 1024x1024
-        )
+    
         
         # Metrics for evaluation remain the same
         self.train_mse = MeanSquaredError()
@@ -322,17 +404,8 @@ class FloodPredictionModel(pl.LightningModule):
         
     def forward(self, x):
         # Extract features from Swin Transformer
-        features = self.model(x)
+        output = self.model(x)
         
-        # Global pooling to get a fixed-size representation
-        B, L, C = features.shape
-        features = features.mean(dim=1)  # [B, C]
-        
-        # Apply regression head
-        output = self.regression_head(features)
-        
-        # Upsample to original resolution
-        output = self.upsampling(output)
         
         return output
     
@@ -344,8 +417,8 @@ class FloodPredictionModel(pl.LightningModule):
         
         # Log metrics
         self.train_mse(y_hat, y)
-        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log('train_mse', self.train_mse, prog_bar=True, on_step=False, on_epoch=True)
+        self.log('train_loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log('train_mse', self.train_mse, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
         
         return loss
     
@@ -361,9 +434,9 @@ class FloodPredictionModel(pl.LightningModule):
         self.val_mae(y_hat, y)
         # self.val_r2(y_hat, y)
         
-        self.log('val_loss', loss, prog_bar=True)
-        self.log('val_mse', self.val_mse, prog_bar=True)
-        self.log('val_mae', self.val_mae, prog_bar=True)
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        self.log('val_mse', self.val_mse, prog_bar=True, sync_dist=True)
+        self.log('val_mae', self.val_mae, prog_bar=True, sync_dist=True)
         # self.log('val_r2', self.val_r2, prog_bar=True)
         
         # Log sample predictions to WandB
@@ -382,8 +455,8 @@ class FloodPredictionModel(pl.LightningModule):
         # Log metrics
         self.test_mse(y_hat, y)
         
-        self.log('test_loss', loss)
-        self.log('test_mse', self.test_mse)
+        self.log('test_loss', loss, sync_dist=True)
+        self.log('test_mse', self.test_mse, sync_dist=True)
         
         return loss
     
@@ -415,14 +488,16 @@ class FloodPredictionModel(pl.LightningModule):
                           horizontalalignment='center', verticalalignment='center',
                           transform=axs[0, 1].transAxes, fontsize=20)
             axs[0, 1].axis('off')
+
+            vmax= target.max()
             
             # Plot target flood depth
-            im2 = axs[1, 0].imshow(target, cmap='Blues')
+            im2 = axs[1, 0].imshow(target, cmap='Blues', vmin=0, vmax=vmax)
             axs[1, 0].set_title('Target Max Flood Depth')
             plt.colorbar(im2, ax=axs[1, 0])
             
             # Plot predicted flood depth
-            im3 = axs[1, 1].imshow(pred, cmap='Blues')
+            im3 = axs[1, 1].imshow(pred, cmap='Blues', vmin=0, vmax=vmax)
             axs[1, 1].set_title('Predicted Max Flood Depth')
             plt.colorbar(im3, ax=axs[1, 1])
             
@@ -452,27 +527,32 @@ class FloodPredictionModel(pl.LightningModule):
         
         # Create learning rate scheduler
         if self.config.training.lr_scheduler == "cosine":
-            scheduler = {
-                'scheduler': torch.optim.lr_scheduler.CosineAnnealingLR(
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer, 
                     T_max=self.config.training.max_epochs,
                     eta_min=1e-6
-                ),
-                'interval': 'epoch',
-                'name': 'lr'
-            }
-        else:
-            scheduler = {
-                'scheduler': torch.optim.lr_scheduler.ReduceLROnPlateau(
+                )
+        elif self.config.training.lr_scheduler == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer,
                     mode='min',
                     factor=0.5,
                     patience=5,
                     verbose=True
-                ),
-                'interval': 'epoch',
-                'monitor': 'val_loss',
-                'name': 'lr'
-            }
+                )
+        elif self.config.training.lr_scheduler == "LinearWarmupCosineAnnealingLR":
+            scheduler = LinearWarmupCosineAnnealingLR(
+                optimizer,
+                warmup_epochs=self.config.training.warmup_epochs,
+                max_epochs=self.config.training.maxepochs,
+                warmup_start_lr=self.config.training.warmuplr,
+                eta_min=self.config.training.etamin,
+            )
         
-        return [optimizer], [scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "train_loss",
+            },
+        }
