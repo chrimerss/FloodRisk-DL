@@ -9,6 +9,7 @@ import wandb
 import torch.nn as nn
 
 from models.flood_model import FloodPredictionModel
+from models.cnn_model import FloodCNNModel
 from data.flood_data_module import FloodDataModule
 
 def init_weights(m):
@@ -32,7 +33,7 @@ def train(config: DictConfig) -> None:
     # Set up wandb logger
     wandb_logger = WandbLogger(
         project=config.logging.project_name,
-        name=f"lr-{config.training.learning_rate:.0e}_{config.model.num_layers}lys_{config.model.num_heads}heads_{config.model.window_size}ws",
+        name=config.logging.run_name,
         log_model=True
     )
     
@@ -53,7 +54,8 @@ def train(config: DictConfig) -> None:
         model=FloodPredictionModel.load_from_checkpoint(config.training.checkpoint, config=config, strict=False)
     else:
         print('initializing model...')
-        model = FloodPredictionModel(config)
+        # model = FloodPredictionModel(config)
+        model= FloodCNNModel(config)
         model.apply(init_weights)
     
     # Set up callbacks
