@@ -1,0 +1,63 @@
+[
+    {
+        "City ID": "HOU002",
+        "Desc": "Houston d02",
+        "500-yr": "162 mm",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm",
+        "1-yr": "48 mm"        
+    },
+    {
+        "City ID": "HOU003",
+        "Desc": "Houston d03",
+        "500-yr": "162 mm",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm",
+        "1-yr": "48 mm"        
+    },
+    {
+        "City ID": "HOU004",
+        "Desc": "Houston d04",
+        "500-yr": "162 mm",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm",
+        "1-yr": "48 mm"        
+    },
+    {
+        "City ID": "HOU005",
+        "Desc": "Houston d05",
+        "500-yr": "162 mm",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm",
+        "1-yr": "48 mm"
+    },
+    {
+        "City ID": "HOU006",
+        "Desc": "Houston d06",
+        "500-yr": "162 mm",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm",
+        "1-yr": "48 mm"
+    },
+
+    {
+        "City ID": "HOU007",
+        "Desc": "Houston d07",
+        "500-yr": "162 mm",
+        "100-yr": "129 mm",
+        "50-yr": "110 mm",
+        "25-yr": "98 mm",
+        "10-yr": "82 mm",
+        "1-yr": "48 mm"
+    }
+]

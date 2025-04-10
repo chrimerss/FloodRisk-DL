@@ -237,21 +237,24 @@ class FloodCNNModel(pl.LightningModule):
             dem = inputs[i, 0].detach().cpu().numpy()
             rainfall = inputs[i, 1].detach().mean().cpu().numpy()
             target = targets[i, 0].detach().cpu().numpy()
+            # denormalize target
+            target= np.exp((target+1e-4) *2)
             pred = predictions[i, 0].detach().cpu().numpy()
+            pred= np.exp((pred+1e-4) *2)
             
             # Create figure with subplots
             fig, axs = plt.subplots(2, 2, figsize=(16, 12))
             
             # Plot DEM
             im0 = axs[0,0].imshow(dem, cmap='terrain')
-            axs[0,0].set_title(f'DEM (Elevation)')
+            axs[0,0].set_title(f'DEM (Rainfall {rainfall}mm)')
             fig.colorbar(im0, ax=axs[0,0])
 
-            # Plot rainfall (just indicate the value)
-            axs[0, 1].text(0.5, 0.5, f'Rainfall: {rainfall:.2f}', 
-                          horizontalalignment='center', verticalalignment='center',
-                          transform=axs[0, 1].transAxes, fontsize=20)
-            axs[0, 1].axis('off')            
+            # Plot histogram of predicted flood depths
+            axs[0, 1].hist(pred.flatten(), bins=50, color='steelblue', edgecolor='black')
+            axs[0, 1].set_title('Histogram of Predicted Depths')
+            axs[0, 1].set_xlabel('Depth (m)')
+            axs[0, 1].set_ylabel('Frequency')
             
             vmax= target.max()
 
@@ -280,19 +283,33 @@ class FloodCNNModel(pl.LightningModule):
         )
         
         # Create learning rate scheduler
-        lr_scheduler = LinearWarmupCosineAnnealingLR(
-            optimizer,
-            warmup_epochs=self.config.training.warmup_epochs,
-            max_epochs=self.config.training.maxepochs,
-            warmup_start_lr=self.config.training.warmuplr,
-            eta_min=self.config.training.etamin
-        )
+        if self.config.training.lr_scheduler == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, 
+                    T_max=self.config.training.max_epochs,
+                    eta_min=1e-6
+                )
+        elif self.config.training.lr_scheduler == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode='min',
+                    factor=0.5,
+                    patience=5,
+                    verbose=True
+                )
+        elif self.config.training.lr_scheduler == "LinearWarmupCosineAnnealingLR":
+            scheduler = LinearWarmupCosineAnnealingLR(
+                optimizer,
+                warmup_epochs=self.config.training.warmup_epochs,
+                max_epochs=self.config.training.maxepochs,
+                warmup_start_lr=self.config.training.warmuplr,
+                eta_min=self.config.training.etamin,
+            )
         
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
-                "scheduler": lr_scheduler,
-                "interval": "epoch",
-                "name": "learning_rate"
-            }
+                "scheduler": scheduler,
+                "monitor": "train_loss",
+            },
         }

@@ -142,12 +142,12 @@ class FloodDataset(Dataset):
         
         # Normalize flood depth
         # depth_normalized = max_depth / (stats['depth_std'] + 1e-8)  # Don't subtract mean for depth
-        depth_normalized= torch.log(max_depth + 1e-4) / 2.0
+        # depth_normalized= torch.log(max_depth + 1e-4) / 2.0
         
         # Rainfall is uniform across domain, no normalization needed
         rainfall_normalized = rainfall / 1000.
         
-        return dem_normalized, depth_normalized, rainfall_normalized
+        return dem_normalized, max_depth, rainfall_normalized
     
     
     def __getitem__(self, idx):
@@ -174,19 +174,27 @@ class FloodDataset(Dataset):
         # Split into DEM and flood depth
         dem = combined_data[2,:,:]
         max_depth = combined_data[0]
+
+        #segmentate flood_depth
+        categories = np.zeros_like(max_depth, dtype=np.int32)
+        categories = np.where(max_depth >= 0.1, 1, categories)
+        categories = np.where(max_depth >= 0.2, 2, categories)
+        categories = np.where(max_depth >= 0.3, 3, categories)
+        categories = np.where(max_depth >= 0.5, 4, categories)
+        categories = np.where(max_depth >= 1.0, 5, categories)
         
         # Convert to torch tensors
         dem_tensor = torch.from_numpy(dem).float().unsqueeze(0)
-        max_depth_tensor = torch.from_numpy(max_depth).float().unsqueeze(0)
+        flood_cat_tensor = torch.from_numpy(categories).float().unsqueeze(0)
         rainfall_tensor = torch.tensor(rainfall_value).float().unsqueeze(0)
         
         # Normalize if required
         if self.normalize:
             dem_normalized, depth_normalized, rainfall_normalized = self.normalize_data(
-                dem_tensor, max_depth_tensor, rainfall_tensor, city_id
+                dem_tensor, flood_cat_tensor, rainfall_tensor, city_id
             )
             dem_tensor = dem_normalized
-            max_depth_tensor = depth_normalized
+            flood_cat_tensor = depth_normalized
             rainfall_tensor = rainfall_normalized
         
         # Create input tensor
@@ -198,7 +206,7 @@ class FloodDataset(Dataset):
             input_tensor = self.transform(input_tensor)
         
         # Create result tuple
-        result = (input_tensor, max_depth_tensor)
+        result = (input_tensor, flood_cat_tensor)
         
         # Update cache (simple LRU implementation)
         if len(self.cache) >= self.cache_size:

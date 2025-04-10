@@ -1,0 +1,57 @@
+#!/bin/bash
+#==========================================================
+# CaMa-Flood sample go script (4) global 15min simulation with "external runoff data"
+# Please follow the doc/Guideline.Md about detail, You need to download external runoff data not included in the package to execute this script.
+# -- Long-term  simulations (1980 spinup -> 1980 ~ 2014)
+# -- Daily runoff forcing (netCDF) at 15min resolution from "E2O WRR2 WCMEF" is used
+# -- input matrix is same as the sample ruoff data (test-15min_nc)
+#
+# (C) X. Zhou, D.Yamazaki & E. Dutra  (U-Tokyo/FCUL)  Feb 2021
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+#   You may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at: http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software distributed under the License is 
+#  distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
+# See the License for the specific language governing permissions and limitations under the License.
+#==========================================================
+
+#*** PBS setting when needed
+#SBATCH --job-name=sweep
+#SBATCH --time=18:00:00
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gpus=4
+#SBATCH --gpu_cmode=shared
+#SBATCH --mem=64G
+#SBATCH -p serc
+
+#================================================
+
+# Load environment or modules
+ml python/3.12.1
+ml cuda/12.6.1
+cd /home/users/li1995/global_flood/FloodRisk-DL/src
+source /home/users/li1995/global_flood/FloodRisk-DL/.venv/bin/activate
+
+# Create a config snapshot
+timestamp=$(date +%Y%m%d_%H%M%S)
+snapshot_dir="sweep_configs/$timestamp"
+mkdir -p "$snapshot_dir"
+cp -r ../configs/* "$snapshot_dir"
+
+# Run the sweep via Hydra
+python train.py \
+  --config-dir "$snapshot_dir" \
+  --config-name model_config \
+  -m \
+  training.learning_rate=0.001,0.0001 \
+  data.batch_size=8 \
+  model.num_layers=3,4\
+  model.window_size=8,16,24\
+  model.patch_size=4,8\
+  logging.checkpoints_dir="checkpoints/swin_log_denorm512"
+
+

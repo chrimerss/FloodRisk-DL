@@ -364,7 +364,7 @@ class SwinTransformer(nn.Module):
         return output
 
 
-class FloodPredictionModel(pl.LightningModule):
+class FloodSWINModel(pl.LightningModule):
     def __init__(self, config):
         """
         Flood prediction model using custom Swin Transformer.
@@ -470,7 +470,10 @@ class FloodPredictionModel(pl.LightningModule):
             dem = inputs[i, 0].detach().cpu().numpy()  # DEM
             rainfall_channel = inputs[i, 1].detach().cpu().numpy()  # Rainfall (uniform value)
             target = targets[i, 0].detach().cpu().numpy()  # Target flood depth
+            ## denormalize target
+            target= np.exp((target + 1e-4) *2)
             pred = predictions[i, 0].detach().cpu().numpy()  # Predicted flood depth
+            pred= np.exp((pred+1e-4) *2)
             
             # Estimate the rainfall value (it should be uniform across the channel)
             rainfall_value = np.mean(rainfall_channel)
@@ -480,14 +483,15 @@ class FloodPredictionModel(pl.LightningModule):
             
             # Plot DEM
             im0 = axs[0, 0].imshow(dem, cmap='terrain')
-            axs[0, 0].set_title(f'DEM (Elevation)')
+            axs[0, 0].set_title(f'DEM ({rainfall_value}mm)')
             plt.colorbar(im0, ax=axs[0, 0])
             
             # Plot rainfall (just indicate the value)
-            axs[0, 1].text(0.5, 0.5, f'Rainfall: {rainfall_value:.2f}', 
-                          horizontalalignment='center', verticalalignment='center',
-                          transform=axs[0, 1].transAxes, fontsize=20)
-            axs[0, 1].axis('off')
+            # Plot histogram of predicted flood depths
+            axs[0, 1].hist(pred.flatten(), bins=50, color='steelblue', edgecolor='black')
+            axs[0, 1].set_title('Histogram of Predicted Depths')
+            axs[0, 1].set_xlabel('Depth (m)')
+            axs[0, 1].set_ylabel('Frequency')
 
             vmax= target.max()
             

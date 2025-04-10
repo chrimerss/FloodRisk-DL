@@ -167,7 +167,7 @@ def crop_geotiff_overlap(input_file, output_dir, crop_size=1024, overlap=100):
                 count += 1
     print(f'{count} of tiles generated')
 
-def crop_geotiff_random(input_flood, input_dem, group, crop_size=1024, num_images=100, random_coords=None, min_distance=50):
+def crop_geotiff_random(input_flood, dem_input, input_lulc, group, crop_size=512, num_images=400, random_coords=None, min_distance=50):
     """
     Randomly crops an input GeoTIFF into multiple 1024x1024 images with flipping, ensuring coordinates are not too close.
     Save training data to cropped_data with .npy
@@ -216,9 +216,12 @@ def crop_geotiff_random(input_flood, input_dem, group, crop_size=1024, num_image
             data = src.read(window=window).squeeze().astype(np.float32)
             with rasterio.open(dem_input) as f:
                 dem= f.read(window=window).squeeze().astype(np.float32)
+
+            with rasterio.open(input_lulc) as f:
+                lulc=f.read(window=window).squeeze().astype(np.float32)
             arr_rain= np.ones(data.shape) * rainfall
-            data= np.stack([data, arr_rain, dem])
-            assert data.shape==(3,1024,1024), f'it has non valid values, {input_file}, its shape is {data.shape}'
+            data= np.stack([data, arr_rain, dem, lulc])
+            assert data.shape==(4,crop_size,crop_size), f'it has non valid values, {input_file}, its shape is {data.shape}'
 
             # Output original data
             city_rainfall= '_'.join(out_name.split('_')[:2])
@@ -274,38 +277,31 @@ def crop_maximum(input_dir, output_dir, rainfall_level=110):
 
 
 if __name__ == "__main__":
-    with open("cities_rainfall.json", "r") as f:
+    with open("HOU_rainfall.json", "r") as f:
         data = json.load(f)
-    train_data= ['HOU002', 'HOU003', 'HOU004', 'HOU005', 'HOU006',
-                 'AUS001','DAL001','OKC001','OKC002','LA001','SF001',
-                 'NYC001','ATL001','ATL002','ORL001','ORL002','MIA001']
-    test_data= ['HOU007', 'AUS002','SF002']
-    val_data= ['DAL002','LA002','NYC002','MIA002']
-    
-    H5= h5py.File('flood_data.h5', 'a')
-    if 'train' not in H5.keys():
-        train= H5.create_group('train')
-        test= H5.create_group('test')
-        val= H5.create_group('val')
-    else:
-        train= H5['train']
-        test= H5['test']
-        val = H5['val']
+    # train_data= ['HOU002', 'HOU003', 'HOU004', 'HOU005', 'HOU006',
+    #              'AUS001','DAL001','OKC001','OKC002','LA001','SF001',
+    #              'NYC001','ATL001','ATL002','ORL001','ORL002','MIA001']
+    # test_data= ['HOU007', 'AUS002','SF002']
+    # val_data= ['DAL002','LA002','NYC002','MIA002']
+    train_data = ['HOU002', 'HOU003', 'HOU004', 'HOU005', 'HOU006']
+    val_data= ['HOU007']
+    test_data= ['HOU007']
 
     for city in data:
         dataset = city['City ID']
         output_dir = f"../cropped_data/{dataset}"
         if dataset in train_data:
-            H5= h5py.File('training.h5', 'a')
+            H5= h5py.File('training_HOU_512_400.h5', 'a')
         elif dataset in test_data:
-            H5= h5py.File('testing.h5', 'a')
+            H5= h5py.File('testing_HOU_512_400.h5', 'a')
         else:
-            H5= h5py.File('validation.h5', 'a')
+            H5= h5py.File('validation_HOU_512_400.h5', 'a')
         group= H5
         print(f'####### Processing {dataset} #######')
 
         first = True
-        for rainfall_level in [city['100-yr'], city['50-yr'], city['25-yr'], city['10-yr']]:
+        for rainfall_level in [city['500-yr'], city['100-yr'], city['50-yr'], city['25-yr'], city['10-yr'], city['1-yr']]:
             rainfall_level = rainfall_level.replace(' ', '')
             group_name= dataset + '_' +rainfall_level
             if group_name in group.keys():
@@ -315,15 +311,16 @@ if __name__ == "__main__":
                 input_dir = f'/home/users/li1995/global_flood/UrbanFloods2D/dataset/{dataset}'
                 dem_input = os.path.join(input_dir, f"{dataset}_DEM.tif")
                 input_file = f'/home/users/li1995/global_flood/UrbanFloods2D/sample/{dataset}_{rainfall_level}_max.tif'
+                input_lulc = f'/home/users/li1995/global_flood/UrbanFloods2D/sample/{dataset}_LULC.tif'
 
                 # crop_maximum(input_dir, '/home/users/li1995/global_flood/UrbanFloods2D/sample', rainfall_level)
                 os.makedirs(output_dir, exist_ok=True)
 
                 if first:
-                    random_coords = crop_geotiff_random(input_file, dem_input, group)
+                    random_coords = crop_geotiff_random(input_file, dem_input, input_lulc, group)
                     first = False
                 else:
-                    crop_geotiff_random(input_file, dem_input, group, random_coords=random_coords)
+                    crop_geotiff_random(input_file, dem_input, input_lulc, group, random_coords=random_coords)
 
         # make_lulc(input_dir, os.path.join('../sample'),input_file)
         # lulc_input= f'../sample/{dataset}_LULC.tif'
