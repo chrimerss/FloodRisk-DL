@@ -10,6 +10,10 @@ src/wandb/*
 sweep_configs/
 *.tif
 src/multirun/
+terratorch/hub/
+terratorch/checkpoints/
+terratorch/output/
+terratorch/wandb/
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python

@@ -8,6 +8,7 @@ from pathlib import Path
 import torchvision.transforms as transforms
 import random
 import json
+import torch.nn.functional as F
 
 class FloodDataset(Dataset):
     def __init__(self, data_dir, split, image_size=512, num_images=400, transform=None, normalize=True, cache_size=100):
@@ -25,7 +26,7 @@ class FloodDataset(Dataset):
         
         mapper= {'train':'training', 'test':'testing', 'val':'validation'}
         self.split = mapper[split]
-        self.h5_file = os.path.join(data_dir, f'{self.split}_{image_size}_{num_images}.h5')
+        self.h5_file = os.path.join(data_dir, f'{self.split}_HOU_{image_size}_{num_images}.h5')
         self.transform = transform
         self.normalize = normalize
         self.cache_size = cache_size
@@ -34,7 +35,7 @@ class FloodDataset(Dataset):
         
         # Don't open the file here, just check it exists
         if not os.path.exists(self.h5_file):
-            raise FileNotFoundError(f"H5 file not found: {h5_file}")
+            raise FileNotFoundError(f"H5 file not found: {self.h5_file}")
         
         # Temporarily open the file to get metadata
         with h5py.File(self.h5_file, 'r') as h5:
@@ -69,7 +70,7 @@ class FloodDataset(Dataset):
         
         # Process smaller batches to reduce memory usage
         for split in ['training', 'validation', 'testing']:
-            h5_file= '/'.join(self.h5_file.split('/')[:-1])+'/'+split+'.h5'
+            h5_file= self.h5_file
             with h5py.File(h5_file, 'r') as h5:
               # Only use training data for stats
                 # Get unique city IDs from subgroup names
@@ -166,6 +167,7 @@ class FloodDataset(Dataset):
             city_id = subgroup_name.split('_')[0]
             
             # Get combined data (2, 1024, 1024)
+            # for HOU data (3,1024,1024)
             combined_data = h5[subgroup_name][f'{tile_idx:04d}'][:] 
             
             # Get rainfall value
@@ -173,6 +175,7 @@ class FloodDataset(Dataset):
         
         # Split into DEM and flood depth
         dem = combined_data[2,:,:]
+        lulc= combined_data[3,:,:]
         max_depth = combined_data[0]
 
         #segmentate flood_depth
@@ -185,28 +188,35 @@ class FloodDataset(Dataset):
         
         # Convert to torch tensors
         dem_tensor = torch.from_numpy(dem).float().unsqueeze(0)
-        flood_cat_tensor = torch.from_numpy(categories).float().unsqueeze(0)
+        flood_cat_tensor = torch.from_numpy(categories).float()
         rainfall_tensor = torch.tensor(rainfall_value).float().unsqueeze(0)
+        lulc_tensor = torch.from_numpy(lulc).float()
+        # print(lulc_tensor.max(), lulc_tensor.min())
+
+        #one-hot encoding LULC
+        lulc_one_hot_tensor= F.one_hot(lulc_tensor.long(), num_classes=10)
+        lulc_one_hot_tensor = lulc_one_hot_tensor.permute(2, 0, 1).float()
+
+        target_one_hot= F.one_hot(flood_cat_tensor.long(), num_classes=6)
+        target_one_hot= target_one_hot.permute(2,0,1).float()
         
         # Normalize if required
         if self.normalize:
-            dem_normalized, depth_normalized, rainfall_normalized = self.normalize_data(
-                dem_tensor, flood_cat_tensor, rainfall_tensor, city_id
-            )
+            dem_normalized = (dem_tensor - dem_tensor.mean()) / dem_tensor.std()
+            
             dem_tensor = dem_normalized
-            flood_cat_tensor = depth_normalized
-            rainfall_tensor = rainfall_normalized
+            
+            rainfall_tensor = rainfall_tensor / 1000.
         
         # Create input tensor
-        rainfall_channel = torch.ones_like(dem_tensor) * rainfall_tensor
-        input_tensor = torch.cat([dem_tensor, rainfall_channel], dim=0)
+        input_tensor = torch.cat([dem_tensor, rainfall_tensor, lulc_one_hot_tensor], dim=0)
         
         # Apply transforms if available
         if self.transform:
             input_tensor = self.transform(input_tensor)
         
         # Create result tuple
-        result = (input_tensor, flood_cat_tensor)
+        result = (input_tensor, target_one_hot)
         
         # Update cache (simple LRU implementation)
         if len(self.cache) >= self.cache_size:

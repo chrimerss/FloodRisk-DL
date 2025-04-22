@@ -4,7 +4,7 @@ defaults:
 # Data settings
 data:
   data_dir: "/home/users/li1995/global_flood/FloodRisk-DL/src/data_preparation"  # Path to the H5 dataset
-  batch_size: 4
+  batch_size: 8
   num_workers: 3
   image_size: 512
   num_images: 400
@@ -12,7 +12,7 @@ data:
   
 # Model settings
 model:
-  in_channels: 2  # DEM and rainfall
+  in_channels: 12  # DEM and rainfall and 10 land cover
   ## This configuration for SWIN transformer
   #name: "swin"
   #patch_size: 4
@@ -35,28 +35,28 @@ model:
   #timestep: 1000
 
   name: "segmentation"
-  backbone: "resnet50"
-  pretrained: True
+  backbone: "swin"
+  pretrained: False
   
 # Training settings
 training:
   max_epochs: 500
-  learning_rate: 0.001
+  learning_rate: 0.01
   accumulate_grad_batches: 8
   weight_decay: 0.05
   lr_scheduler: "LinearWarmupCosineAnnealingLR"
   warmup_epochs: 5
   maxepochs: 50
-  warmuplr: 1e-6
+  warmuplr: 1e-5
   etamin: 1e-6
   checkpoint: 
   
   
 # Logging settings
 logging:
-  checkpoints_dir: "checkpoints/UnetDiffusion"
-  project_name: "UrbanFlood2D"
-  run_name: "Diffusion-lr1e-4"
+  checkpoints_dir: "checkpoints/Segmentation"
+  project_name: "UrbanFlood2D-Segmentation"
+  run_name: "resnet101"
   log_every_n_steps: 10
   save_top_k: 1
   monitor: "val_loss"

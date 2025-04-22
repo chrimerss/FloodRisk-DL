@@ -12,7 +12,9 @@ from models.swin_model import FloodSWINModel
 from models.cnn_model import FloodCNNModel
 from models.diffusion_model import FloodDiffusionModel
 from models.cnn_seg_model import FloodSegmentationModel
-from data.flood_data_module import FloodDataModule
+from models.swin_seg_model import SWINSegmentationModel
+# from data.flood_data_module import FloodDataModule
+from data.flood_data_seg import FloodDataModule
 
 
 def init_weights(m):
@@ -32,6 +34,7 @@ def train(config: DictConfig) -> None:
     print(OmegaConf.to_yaml(config))
 
     torch.set_float32_matmul_precision('high')
+    torch.use_deterministic_algorithms(False, warn_only=True)
 
     wandb.config = OmegaConf.to_container(
         config, resolve=True, throw_on_missing=True
@@ -71,7 +74,8 @@ def train(config: DictConfig) -> None:
         elif config.model.name=='diffusion':
             model= FloodDiffusionModel(config)
         elif config.model.name=='segmentation':
-            model= FloodSegmentationModel(config)
+            # model= FloodSegmentationModel(config)
+            model = SWINSegmentationModel(config)
         else:
             raise ValueError('model name has to be in [swin, unet]]')
         # model.apply(init_weights)
@@ -99,7 +103,7 @@ def train(config: DictConfig) -> None:
         accumulate_grad_batches=config.training.accumulate_grad_batches,
         accelerator="auto",  # Use GPU if available
         devices='auto',
-        strategy='ddp',
+        strategy='ddp_find_unused_parameters_true',
         logger=wandb_logger,
         callbacks=[checkpoint_callback, early_stopping_callback, lr_monitor],
         log_every_n_steps=config.logging.log_every_n_steps,

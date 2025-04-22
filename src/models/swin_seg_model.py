@@ -9,6 +9,7 @@ import numpy as np
 from torchvision.models.segmentation import deeplabv3_resnet50, deeplabv3_resnet101, DeepLabV3_ResNet101_Weights, DeepLabV3_ResNet50_Weights
 from .lr_scheduler import LinearWarmupCosineAnnealingLR
 from enum import Enum
+from timm.models import SwinTransformerV2
 
 class FloodCategory(Enum):
     """Enumeration of flood categories based on max flood depth."""
@@ -33,7 +34,7 @@ class FloodSegmentationModule(nn.Module):
     Flood segmentation model using pretrained DeepLabV3 from torchvision.
     Uses transfer learning and adapts the model for flood depth prediction.
     """
-    def __init__(self, backbone="resnet50", in_channels=2, num_classes=6, pretrained=True):
+    def __init__(self, image_size=512, in_channels=3, num_classes=6):
         """
         Initialize the segmentation model.
         
@@ -46,51 +47,19 @@ class FloodSegmentationModule(nn.Module):
         super().__init__()
         
         # Select backbone and load pretrained weights if requested
-        if backbone == "resnet50":
-            weights = DeepLabV3_ResNet50_Weights.DEFAULT if pretrained else None
-            self.model = deeplabv3_resnet50(weights=weights)
-        else:
-            weights = DeepLabV3_ResNet101_Weights.DEFAULT if pretrained else None
-            self.model = deeplabv3_resnet101(weights=weights)
-        
-        # Adapt the first layer for 2-channel input (DEM and rainfall)
-        # Preserve pretrained weights for RGB channels and initialize the new channel
-        if in_channels != 3:
-            original_conv = self.model.backbone.conv1
-            new_conv = nn.Conv2d(
-                in_channels=in_channels, 
-                out_channels=original_conv.out_channels,
-                kernel_size=original_conv.kernel_size, 
-                stride=original_conv.stride,
-                padding=original_conv.padding,
-                bias=original_conv.bias
-            )
-            
-            # Initialize weights using pretrained weights
-            if pretrained:
-                # For 2 channels, reuse the first two channels from the pretrained model
-                new_conv.weight.data[:, :2, :, :] = original_conv.weight.data[:, :2, :, :]
-                
-                # For additional channels, initialize with random values
-                if in_channels > 3:
-                    new_conv.weight.data[:, 3:, :, :] = torch.randn(
-                        original_conv.weight.data[:, 0, :, :].shape[0], 
-                        in_channels - 3, 
-                        original_conv.weight.data.shape[2], 
-                        original_conv.weight.data.shape[3]
-                    ) * 0.01
-            
-            # Replace the model's first convolution layer
-            self.model.backbone.conv1 = new_conv
-        
-        # Replace the classifier to output the desired number of classes
-        self.model.classifier = nn.Sequential(
-            nn.Conv2d(2048, 256, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(256, num_classes, kernel_size=1)
+        self.model= SwinTransformerV2(
+            img_size= image_size,
+            in_chans= 12,
+            num_classes= 6,
+            embed_dim= 96,
+            depths= (2,2,6,2),
+            num_heads= (3,6,12,24),
+            window_size=8,
+
         )
         
+        # Replace the classifier to output the desired number of classes
+
     def forward(self, x):
         """
         Forward pass through the model.
@@ -101,12 +70,12 @@ class FloodSegmentationModule(nn.Module):
         Returns:
             torch.Tensor: Output segmentation [B, num_classes, H, W]
         """
-        # The DeepLabV3 model returns a dict with 'out' key for the output
-        result = self.model(x)
-        return result['out']
+        
+        x = self.model(x)
+        return x
 
 
-class FloodSegmentationModel(pl.LightningModule):
+class SWINSegmentationModel(pl.LightningModule):
     """PyTorch Lightning module for training and evaluating the flood segmentation model."""
     def __init__(self, config):
         """
@@ -120,19 +89,19 @@ class FloodSegmentationModel(pl.LightningModule):
         self.config = config
         
         # Model parameters
-        backbone = config.model.get('backbone', "resnet50")
-        in_channels = config.model.get('in_channels', 2)  # Default: DEM and rainfall channels
-        num_classes = 6  # Number of flood categories (NO_FLOOD, NUISANCE, MINOR, MEDIUM, MAJOR, EXTREME)
-        pretrained = config.model.get('pretrained', True)
         # torch.use_deterministic_algorithms(False, warn_only=True)
         # Initialize model
         self.model = FloodSegmentationModule(
-            backbone=backbone,
-            in_channels=in_channels,
-            num_classes=num_classes,
-            pretrained=pretrained
+                    image_size=512,
+                    in_channels=3,
+                    num_classes=6
         )
-        
+        self.model.head = nn.Sequential(
+            nn.Conv2d(2048, 256, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, num_classes, kernel_size=1)
+        )
         # Loss functions
         self.ce_loss = nn.CrossEntropyLoss(reduction="none")
 
@@ -147,7 +116,7 @@ class FloodSegmentationModel(pl.LightningModule):
         
         
         # Calculate classification loss
-        class_loss = self.ce_loss(logits, targets)
+        class_loss = self.ce_loss(logits, targets.squeeze().long())
         class_loss= class_loss.mean()
         # Convert predicted categories back to depth for regression metrics
         _, predicted_categories = torch.max(logits, dim=1)
@@ -162,21 +131,18 @@ class FloodSegmentationModel(pl.LightningModule):
         inputs, targets = batch
         logits = self(inputs)
         # print(logits.max(dim=1))
-        
+        print(logits.size(), targets.size())
         # Calculate classification loss
-        class_loss = self.ce_loss(logits, targets)
+        class_loss = self.ce_loss(logits, targets.squeeze().long())
         class_loss= class_loss.mean()
         
         # Convert predicted categories back to depth for regression metrics
         _, predicted_categories = torch.max(logits, dim=1)
 
-
-        targets_cat= torch.argmax(targets, dim=1) + 1
-
         self.log('val_loss', class_loss, on_step=True, on_epoch=True, prog_bar=True)
         # Visualize predictions for first batch
         if batch_idx == 0:
-            self._log_predictions(inputs, targets_cat, predicted_categories)
+            self._log_predictions(inputs, targets, predicted_categories)
             
         return class_loss
     
@@ -185,7 +151,7 @@ class FloodSegmentationModel(pl.LightningModule):
         logits = self(inputs)
         
         # Calculate classification loss
-        class_loss = self.ce_loss(logits, targets)
+        class_loss = self.ce_loss(logits, targets.squeeze().long())
         class_loss= class_loss.mean()
         # Convert predicted categories back to depth for regression metrics
         _, predicted_categories = torch.max(logits, dim=1)
@@ -199,7 +165,8 @@ class FloodSegmentationModel(pl.LightningModule):
         """Log visualizations of model predictions to wandb."""
         # Only log a limited number of samples
         batch_size = min(num_samples, inputs.size(0))
-    
+        
+        
         
         # Create color maps for visualization
         flood_colors = [FLOOD_COLORS[FloodCategory(i)] for i in range(6)]
@@ -211,7 +178,7 @@ class FloodSegmentationModel(pl.LightningModule):
             rainfall = inputs[i, 1].detach().cpu().numpy()  # Rainfall
             rainfall_value = np.mean(rainfall)  # Estimate rainfall value
             
-            target_cat = targets[i].detach().cpu().numpy()
+            target_cat = targets[i, 0].detach().cpu().numpy()
 
             pred_cat = predicted_categories[i].detach().cpu().numpy()
 
