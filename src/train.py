@@ -15,6 +15,7 @@ from models.cnn_seg_model import FloodSegmentationModel
 from models.swin_seg_model import SWINSegmentationModel
 # from data.flood_data_module import FloodDataModule
 from data.flood_data_seg import FloodDataModule
+from task_class import model_args_tiny, model_args_100, model_args_300, model_args_600
 
 
 def init_weights(m):

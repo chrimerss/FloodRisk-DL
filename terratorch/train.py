@@ -11,10 +11,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch.utils.data import Dataset, DataLoader
 from terratorch.tasks import SemanticSegmentationTask
+from task_class import model_args_tiny, model_args_100, model_args_300, model_args_600
 
 
 def main():
@@ -25,10 +26,10 @@ def main():
     
     # Data paths and parameters
     data_dir = "/home/users/li1995/global_flood/FloodRisk-DL/src/data_preparation"  # Update this to your actual path
-    output_dir = "output/all"
-    batch_size = 16
+    output_dir = "output/all-100"
+    batch_size = 32
     max_epochs = 100
-    num_workers = 8
+    num_workers = 4
     
     # Set up data module
     data_module = FloodSegmentationDataModule(
@@ -40,22 +41,10 @@ def main():
     )
     
     # Set up model configuration with Prithvi backbone
-    model_args = {
-        "backbone_bands": ["BLUE", "NIR_BROAD", "SWIR_1"],
-        "backbone": "prithvi_eo_v2_300",
-        "backbone_pretrained": True,
-        "backbone_img_size": 512,
-        "backbone_patch_embed_cfg": {"in_channels": 2},  # Configure for 12-channel input
-        "necks": [
-            {"name": "SelectIndices", "indices": [5, 11, 17, 23]},
-            {"name": "ReshapeTokensToImage"},
-            {"name": "LearnedInterpolateToPyramidal"}
-        ],
-        "decoder": "UNetDecoder",
-        "decoder_channels": [512, 256, 128, 64],
-        "head_dropout": 0.1,
-        "num_classes": 5
-    }
+    model_args = model_args_100
+
+    ## CNN backbone
+    
 
     # scheduler_args = dict(warmup_epochs=5, max_epochs=50, eta_min=1e-8)
     scheduler_args= dict(mode='min', factor=0.1, patience=10)
@@ -89,13 +78,19 @@ def main():
         filename="best-{epoch}",
         save_top_k=1
     )
+
+    early_stopping = EarlyStopping(
+        monitor="val/Multiclass_Jaccard_Index",
+        patience=20,
+        mode="max",
+    )    
     
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     
     # Set up logger
     logger = WandbLogger(
         project='UrbanFloods2D-Segmentation',
-        name='Prvith-retrain-all',
+        name='Prvith-retrain-all-100',
         log_model=True
     )
     
@@ -103,9 +98,11 @@ def main():
     trainer = pl.Trainer(
         accelerator="auto",  # Use GPU if available
         devices="auto",
+        strategy='ddp_find_unused_parameters_true',
         max_epochs=max_epochs,
-        callbacks=[checkpoint_callback, lr_monitor],
+        callbacks=[checkpoint_callback, lr_monitor, early_stopping],
         logger=logger,
+        accumulate_grad_batches=4,
         log_every_n_steps=20,
         precision="16-mixed"  # Use mixed precision for faster training
     )
