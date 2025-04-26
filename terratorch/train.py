@@ -26,10 +26,10 @@ def main():
     
     # Data paths and parameters
     data_dir = "/home/users/li1995/global_flood/FloodRisk-DL/src/data_preparation"  # Update this to your actual path
-    output_dir = "output/all-100"
-    batch_size = 32
+    output_dir = "output/all-300"
+    batch_size = 16
     max_epochs = 100
-    num_workers = 4
+    num_workers = 8
     
     # Set up data module
     data_module = FloodSegmentationDataModule(
@@ -41,7 +41,7 @@ def main():
     )
     
     # Set up model configuration with Prithvi backbone
-    model_args = model_args_100
+    model_args = model_args_300
 
     ## CNN backbone
     
@@ -90,7 +90,7 @@ def main():
     # Set up logger
     logger = WandbLogger(
         project='UrbanFloods2D-Segmentation',
-        name='Prvith-retrain-all-100',
+        name='Prvith-retrain-all-300',
         log_model=True
     )
     
@@ -102,7 +102,7 @@ def main():
         max_epochs=max_epochs,
         callbacks=[checkpoint_callback, lr_monitor, early_stopping],
         logger=logger,
-        accumulate_grad_batches=4,
+        accumulate_grad_batches=8,
         log_every_n_steps=20,
         precision="16-mixed"  # Use mixed precision for faster training
     )
