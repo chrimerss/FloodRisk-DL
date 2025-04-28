@@ -67,3 +67,12 @@ model_args_600 = {
     "num_classes": 5
 }
 
+model_args_unet = {
+        "backbone":"resnet101", # see smp_encoders.keys()
+        'model': 'UnetPlusPlus', # 'DeepLabV3', 'DeepLabV3Plus', 'FPN', 'Linknet', 'MAnet', 'PAN', 'PSPNet', 'Unet', 'UnetPlusPlus' 
+        "bands": ["BLUE", "NIR_BROAD", "SWIR_1"],
+        "in_channels": 3,
+        "num_classes": 5,
+        "pretrained": False,
+}
+

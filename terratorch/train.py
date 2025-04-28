@@ -15,7 +15,7 @@ from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch.utils.data import Dataset, DataLoader
 from terratorch.tasks import SemanticSegmentationTask
-from task_class import model_args_tiny, model_args_100, model_args_300, model_args_600
+from task_class import model_args_tiny, model_args_100, model_args_300, model_args_600, model_args_unet
 
 
 def main():
@@ -26,8 +26,8 @@ def main():
     
     # Data paths and parameters
     data_dir = "/home/users/li1995/global_flood/FloodRisk-DL/src/data_preparation"  # Update this to your actual path
-    output_dir = "output/all-300"
-    batch_size = 16
+    output_dir = "output/all-unet-res101"
+    batch_size = 8
     max_epochs = 100
     num_workers = 8
     
@@ -41,7 +41,7 @@ def main():
     )
     
     # Set up model configuration with Prithvi backbone
-    model_args = model_args_300
+    model_args = model_args_unet
 
     ## CNN backbone
     
@@ -54,21 +54,34 @@ def main():
     class_weights = [0.5, 1.0, 1.0, 1.0, 1.5]  # Adjust if needed
     
     # Create the segmentation task
+    # model = SemanticSegmentationTask(
+    #     model_args=model_args,
+    #     model_factory="EncoderDecoderFactory",
+    #     loss="ce",  # Cross-entropy loss
+    #     optimizer="AdamW",
+    #     optimizer_hparams={"weight_decay": 0.05},
+    #     class_names=class_names,
+    #     class_weights=class_weights,
+    #     scheduler='ReduceLROnPlateau',
+    #     scheduler_hparams=scheduler_args,
+    #     lr=1e-4,
+    #     ignore_index=-1,
+    #     freeze_backbone=False,
+    #     plot_on_val=1
+    # )
+
     model = SemanticSegmentationTask(
-        model_args=model_args,
-        model_factory="EncoderDecoderFactory",
-        loss="ce",  # Cross-entropy loss
-        optimizer="AdamW",
-        optimizer_hparams={"weight_decay": 0.05},
-        class_names=class_names,
-        class_weights=class_weights,
-        scheduler='ReduceLROnPlateau',
-        scheduler_hparams=scheduler_args,
-        lr=1e-4,
-        ignore_index=-1,
-        freeze_backbone=False,
-        plot_on_val=1
-    )
+            model_args=model_args,
+            model_factory="SMPModelFactory",
+            loss="ce",
+            lr=1e-4,
+            ignore_index=-1,
+            optimizer="AdamW",
+            optimizer_hparams={"weight_decay": 0.05},
+            freeze_backbone=False,
+            class_names=class_names,
+            class_weights=class_weights
+        )
     
     # Set up callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -90,7 +103,7 @@ def main():
     # Set up logger
     logger = WandbLogger(
         project='UrbanFloods2D-Segmentation',
-        name='Prvith-retrain-all-300',
+        name='all-unet-res101',
         log_model=True
     )
     

@@ -47,7 +47,7 @@ FLOOD_COLORS = {
 }
 
 # Available rainfall levels
-RAINFALL_LEVELS = ["162mm", "129mm", "110mm", "98mm", "82mm", "48mm"]
+RAINFALL_LEVELS = ["181mm", "162mm", "138mm", "123mm", "110mm", "98mm", "82mm", "70mm", "57mm", "48mm"]
 
 # Function to classify flood depths into categories
 def classify_depths(src):
