@@ -26,7 +26,7 @@ def main():
     
     # Data paths and parameters
     data_dir = "/home/users/li1995/global_flood/FloodRisk-DL/src/data_preparation"  # Update this to your actual path
-    output_dir = "output/all-unet-res101"
+    output_dir = "output/all-unet-res152"
     batch_size = 8
     max_epochs = 100
     num_workers = 8
@@ -103,7 +103,7 @@ def main():
     # Set up logger
     logger = WandbLogger(
         project='UrbanFloods2D-Segmentation',
-        name='all-unet-res101',
+        name='all-unet-res152',
         log_model=True
     )
     

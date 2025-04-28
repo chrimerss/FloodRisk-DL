@@ -22,6 +22,9 @@ from collections import defaultdict
 
 from terratorch.tasks import SemanticSegmentationTask
 
+# Define buffer size for input data
+BUFFER = 10
+
 # Import model arguments from task_class.py
 from task_class import model_args_tiny, model_args_100, model_args_300, model_args_600
 
@@ -154,15 +157,87 @@ def prepare_data_window(domain, rainfall_level, window):
     with rasterio.open(dem_input) as src:
         dem = src.read(window=window).squeeze().astype(np.float32)
         slope = calc_slope(dem)
+        
+        # Apply buffer to both DEM and slope - slicing with [BUFFER:-BUFFER, BUFFER:-BUFFER]
+        # Only apply buffer if the arrays are large enough
+        if dem.shape[0] > 2*BUFFER and dem.shape[1] > 2*BUFFER:
+            dem = dem[BUFFER:-BUFFER, BUFFER:-BUFFER]
+            slope = slope[BUFFER:-BUFFER, BUFFER:-BUFFER]
+            
         dem = (dem - dem.mean()) / dem.std()  # Normalize
     
     # Load target flood depths
     with rasterio.open(input_file) as src:    
         target = src.read(window=window).squeeze().astype(np.float32)
         flood_cat = classify_depths(target)
+        
+        # Apply the same buffer to the target and flood_cat
+        if target.shape[0] > 2*BUFFER and target.shape[1] > 2*BUFFER:
+            target = target[BUFFER:-BUFFER, BUFFER:-BUFFER]
+            flood_cat = flood_cat[BUFFER:-BUFFER, BUFFER:-BUFFER]
     
     # Prepare rainfall input (constant value across the image)
     rainfall = np.ones_like(dem) * int(rainfall_level.split('mm')[0])/1000.
+    
+    return dem, slope, rainfall, flood_cat, target
+
+# Function to load the entire dataset
+def load_full_dataset(domain, rainfall_level, crop_size=512):
+    """Load the entire DEM and flood data for a domain and rainfall level.
+    
+    Args:
+        domain: The domain to use (e.g., 'HOU001')
+        rainfall_level: The rainfall level to use (e.g., '98mm')
+        crop_size: Size of the window to use for inference (default: 512)
+        
+    Returns:
+        dem, slope, rainfall, flood_cat, target (all sliced to multiples of crop_size)
+    """
+    input_dir = f'/home/users/li1995/global_flood/UrbanFloods2D/dataset/{domain}'
+    dem_input = os.path.join(input_dir, f"{domain}_DEM.tif")
+    input_file = f'/home/users/li1995/global_flood/UrbanFloods2D/sample/{domain}_{rainfall_level}_max.tif'
+    
+    # Load DEM and calculate slope for the entire domain
+    with rasterio.open(dem_input) as src:
+        dem = src.read(1).astype(np.float32)
+        
+    # Calculate slope from DEM
+    slope = calc_slope(dem)
+    
+    # Load target flood depths
+    with rasterio.open(input_file) as src:
+        target = src.read(1).astype(np.float32)
+    
+    # Classify target depths into categories
+    flood_cat = classify_depths(target)
+    
+    # Prepare rainfall input (constant value across the image)
+    rainfall = np.ones_like(dem) * int(rainfall_level.split('mm')[0])/1000.
+    
+    # Apply buffer to all arrays if they are large enough
+    if dem.shape[0] > 2*BUFFER and dem.shape[1] > 2*BUFFER:
+        dem = dem[BUFFER:-BUFFER, BUFFER:-BUFFER]
+        slope = slope[BUFFER:-BUFFER, BUFFER:-BUFFER]
+        target = target[BUFFER:-BUFFER, BUFFER:-BUFFER]
+        flood_cat = flood_cat[BUFFER:-BUFFER, BUFFER:-BUFFER]
+        rainfall = rainfall[BUFFER:-BUFFER, BUFFER:-BUFFER]
+    
+    # Normalize DEM
+    dem = (dem - dem.mean()) / dem.std()
+    
+    # Calculate how many complete crop_size blocks fit in the dimensions
+    height, width = dem.shape
+    complete_height = (height // crop_size) * crop_size
+    complete_width = (width // crop_size) * crop_size
+    
+    # Slice arrays to ensure dimensions are multiples of crop_size
+    if complete_height < height or complete_width < width:
+        print(f"  Slicing arrays to multiple of {crop_size}: from {height}x{width} to {complete_height}x{complete_width}")
+        dem = dem[:complete_height, :complete_width]
+        slope = slope[:complete_height, :complete_width]
+        target = target[:complete_height, :complete_width]
+        flood_cat = flood_cat[:complete_height, :complete_width]
+        rainfall = rainfall[:complete_height, :complete_width]
     
     return dem, slope, rainfall, flood_cat, target
 
@@ -214,54 +289,6 @@ def calculate_jaccard_scores(true, pred):
         'medium': class_jaccard[3],    # Class 3: MEDIUM
         'major': class_jaccard[4]      # Class 4: MAJOR
     }
-
-# Function to plot sample predictions
-def plot_sample_predictions(dem, slope, flood_cat, predictions, model_names, output_dir, window_idx=None, rainfall_level=None):
-    """Plot sample predictions from different models."""
-    
-    n_models = len(predictions)
-    fig_width = 4 + 3 * n_models
-    
-    fig, axes = plt.subplots(1, 2 + n_models, figsize=(fig_width, 8), constrained_layout=True)
-    
-    # Create colormap for flood categories
-    flood_colors = [FLOOD_COLORS[FloodCategory(i)] for i in range(len(FloodCategory))]
-    cmap = ListedColormap(flood_colors)
-    norm = mpl.colors.Normalize(vmin=0, vmax=4)
-    
-    # Plot DEM
-    axes[0].set_title("DEM")
-    im1 = axes[0].imshow(dem, cmap='terrain')
-    fig.colorbar(im1, ax=axes[0])
-    
-    # Plot ground truth
-    axes[1].set_title("Ground Truth")
-    im2 = axes[1].imshow(flood_cat, cmap=cmap, norm=norm)
-    cbar = fig.colorbar(im2, ax=axes[1], ticks=range(len(FloodCategory)))
-    cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
-    
-    # Plot predictions for each model
-    for i, (pred, model_name) in enumerate(zip(predictions, model_names)):
-        axes[i+2].set_title(f"Predicted: {model_name}")
-        im = axes[i+2].imshow(pred, cmap=cmap, norm=norm)
-        cbar = fig.colorbar(im, ax=axes[i+2], ticks=range(len(FloodCategory)))
-        cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
-    
-    # Add title with window and rainfall info if provided
-    if window_idx is not None and rainfall_level is not None:
-        fig.suptitle(f"Rainfall: {rainfall_level}, Window: {window_idx}", fontsize=16)
-    
-    # Save the figure
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f'sample_predictions_{timestamp}'
-    if window_idx is not None:
-        filename += f'_window{window_idx}'
-    if rainfall_level is not None:
-        filename += f'_{rainfall_level}'
-    filename += '.png'
-    
-    plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
-    plt.close()
 
 # Function to plot histograms
 def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
@@ -328,9 +355,6 @@ def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
     filename += '.png'
     plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
     plt.close()
-    
-    # 3. Plot pixel count distribution for ground truth and predictions
-    # This will be added in the main function
 
 def main():
     # Set up device for inference
@@ -373,206 +397,254 @@ def main():
         except Exception as e:
             print(f"  Error loading model {model_name}: {e}")
     
-    # Get the full dimensions of the image
-    height, width = get_image_dimensions(domain)
-    print(f"Image dimensions: {height} x {width}")
-    
-    # Calculate how many windows we need to cover the entire image
-    n_windows_y = height // crop_size
-    n_windows_x = width // crop_size
-    print(f"Processing {n_windows_y * n_windows_x} windows ({n_windows_y} x {n_windows_x})")
-    
-    # Container for all results across rainfall levels
-    all_rainfall_results = {}
-    
-    # Create CSV files for storing all results
+    # Create CSV files for storing results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    overall_csv_path = os.path.join(output_dir, f'overall_model_evaluation_{timestamp}.csv')
-    overall_pixel_csv_path = os.path.join(output_dir, f'overall_pixel_counts_{timestamp}.csv')
+    region_jaccard_csv_path = os.path.join(output_dir, f'region_jaccard_scores_{timestamp}.csv')
+    pixel_counts_csv_path = os.path.join(output_dir, f'overall_pixel_counts_{timestamp}.csv')
     
-    # Headers for the overall CSV files
-    overall_results_df = pd.DataFrame(columns=[
-        'Rainfall', 'Window', 'Model', 'Epochs',
+    # Headers for the CSV files
+    region_jaccard_df = pd.DataFrame(columns=[
+        'Rainfall', 'Model', 'Epochs',
         'Jaccard_No_Flood', 'Jaccard_Flood',
-        'Jaccard_Nuisance', 'Jaccard_Minor', 'Jaccard_Moderate', 'Jaccard_Major'
+        'Jaccard_Nuisance', 'Jaccard_Minor', 'Jaccard_Medium', 'Jaccard_Major'
     ])
     
-    overall_pixel_counts_df = pd.DataFrame(columns=[
-        'Rainfall', 'Window', 'Category', 'Ground_Truth'
+    pixel_counts_df = pd.DataFrame(columns=[
+        'Rainfall', 'Category', 'Ground_Truth', 'Ground_Truth_Pct'
     ])
-    # Add columns for each model
+    
+    # Add columns for each model to pixel counts dataframe
     for model_name in model_paths.keys():
-        overall_pixel_counts_df[f'Pred_{model_name}'] = None
-        overall_pixel_counts_df[f'Ground_Truth_Pct'] = None
-        overall_pixel_counts_df[f'Pred_{model_name}_Pct'] = None
+        pixel_counts_df[f'Pred_{model_name}'] = None
+        pixel_counts_df[f'Pred_{model_name}_Pct'] = None
+    
+    # Dictionary to store results for all rainfall levels
+    all_rainfall_results = {}
     
     # Process each rainfall level
     for rainfall_level in RAINFALL_LEVELS:
         print(f"\nProcessing rainfall level: {rainfall_level}")
         
-        # Containers for aggregated results for this rainfall level
-        rainfall_results = []
-        rainfall_pixel_counts = []
-        rainfall_predictions = []
-        
-        # Process each window
-        for y in range(n_windows_y):
-            for x in range(n_windows_x):
-                window_idx = y * n_windows_x + x
-                print(f"  Processing window {window_idx} ({x}, {y})")
-                
-                # Define the window
-                window = Window(x * crop_size, y * crop_size, crop_size, crop_size)
-                
-                # Prepare data for this window
-                try:
-                    dem, slope, rainfall, flood_cat, target = prepare_data_window(domain, rainfall_level, window)
-                except Exception as e:
-                    print(f"    Error preparing data for window {window_idx}: {e}")
-                    continue
-                
-                # Count pixels in ground truth for this window
-                gt_pixel_counts, total_pixels = count_pixels_by_category(flood_cat)
-                
-                # Process each model
-                window_results = []
-                window_predictions = []
-                window_pixel_counts = []
-                
-                for model_name, model in models.items():
-                    try:
-                        # Prepare input tensor
-                        model_input = np.stack([dem, slope, rainfall])
-                        input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(device)
-                        
-                        # Get prediction
-                        with torch.no_grad():
-                            pred = model(input_tensor).output.squeeze().detach().cpu().numpy()
-                            pred = pred.argmax(axis=0)
-                        
-                        # Calculate metrics
-                        jaccard_scores = calculate_jaccard_scores(flood_cat, pred)
-                        
-                        # Count pixels in prediction
-                        pred_pixel_counts, _ = count_pixels_by_category(pred)
-                        
-                        # Store results for this window and model
-                        window_results.append(jaccard_scores)
-                        window_predictions.append(pred)
-                        window_pixel_counts.append(pred_pixel_counts)
-                        
-                        # Add to overall results DataFrame
-                        overall_results_df = pd.concat([overall_results_df, pd.DataFrame({
-                            'Rainfall': [rainfall_level],
-                            'Window': [window_idx],
-                            'Model': [model_name],
-                            'Epochs': [model_epochs[model_name]],
-                            'Jaccard_No_Flood': [jaccard_scores['no_flood']],
-                            'Jaccard_Flood': [jaccard_scores['binary']],
-                            'Jaccard_Nuisance': [jaccard_scores['nuisance']],
-                            'Jaccard_Minor': [jaccard_scores['minor']],
-                            'Jaccard_Moderate': [jaccard_scores['medium']],
-                            'Jaccard_Major': [jaccard_scores['major']]
-                        })], ignore_index=True)
-                        
-                    except Exception as e:
-                        print(f"    Error processing model {model_name} for window {window_idx}: {e}")
-                
-                # If we have results for this window, save them
-                if window_results:
-                    # Store results from this window
-                    rainfall_results.append(window_results)
-                    rainfall_predictions.append(window_predictions)
-                    rainfall_pixel_counts.append(window_pixel_counts)
+        try:
+            # Load the entire dataset at once (with buffer applied)
+            print(f"  Loading full dataset for {domain} with rainfall {rainfall_level}...")
+            dem, slope, rainfall, flood_cat, target = load_full_dataset(domain, rainfall_level)
+            
+            height, width = dem.shape
+            print(f"  Dataset dimensions after applying buffer: {height} x {width}")
+            
+            # Create prediction arrays for each model
+            print(f"  Creating prediction arrays...")
+            predictions = {model_name: np.zeros_like(flood_cat, dtype=np.int64) 
+                          for model_name in models.keys()}
+            
+            # Calculate how many windows we need to cover the entire image
+            n_windows_y = (height - crop_size + 1) // crop_size + (1 if (height - crop_size + 1) % crop_size != 0 else 0)
+            n_windows_x = (width - crop_size + 1) // crop_size + (1 if (width - crop_size + 1) % crop_size != 0 else 0)
+            
+            print(f"  Processing {n_windows_y * n_windows_x} windows ({n_windows_y} x {n_windows_x}) for inference")
+            
+            # Process each window for inference
+            for y in range(n_windows_y):
+                for x in range(n_windows_x):
+                    window_idx = y * n_windows_x + x
+                    print(f"    Processing window {window_idx} ({x}, {y})")
                     
-                    # Update pixel counts in overall DataFrame
-                    categories = ['No Flood', 'Nuisance', 'Minor', 'Medium', 'Major', 'Total Flood']
-                    for i, category in enumerate(categories):
-                        if i < 5:  # Regular categories
-                            gt_count = gt_pixel_counts[i]
-                        else:  # Total Flood
-                            gt_count = gt_pixel_counts['flood']
-                        
-                        row_data = {
-                            'Rainfall': rainfall_level,
-                            'Window': window_idx,
-                            'Category': category,
-                            'Ground_Truth': gt_count,
-                            'Ground_Truth_Pct': (gt_count / total_pixels) * 100
-                        }
-                        
-                        # Add model predictions
-                        for j, (model_name, pixel_counts) in enumerate(zip(model_paths.keys(), window_pixel_counts)):
-                            if i < 5:  # Regular categories
-                                pred_count = pixel_counts[i]
-                            else:  # Total Flood
-                                pred_count = pixel_counts['flood']
+                    # Calculate window coordinates
+                    y_start = y * crop_size
+                    y_end = min(y_start + crop_size, height)
+                    x_start = x * crop_size
+                    x_end = min(x_start + crop_size, width)
+                    
+                    # Handle edge cases where the window is smaller than crop_size
+                    if y_end - y_start < crop_size or x_end - x_start < crop_size:
+                        # For edge cases, take a full crop_size window from the boundary
+                        y_start = max(0, height - crop_size) if y == n_windows_y - 1 else y_start
+                        x_start = max(0, width - crop_size) if x == n_windows_x - 1 else x_start
+                        y_end = y_start + crop_size
+                        x_end = x_start + crop_size
+                    
+                    # Extract window data
+                    dem_window = dem[y_start:y_end, x_start:x_end]
+                    slope_window = slope[y_start:y_end, x_start:x_end]
+                    rainfall_window = rainfall[y_start:y_end, x_start:x_end]
+                    
+                    # Process each model
+                    for model_name, model in models.items():
+                        try:
+                            # Prepare input tensor
+                            model_input = np.stack([dem_window, slope_window, rainfall_window])
+                            input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(device)
                             
-                            row_data[f'Pred_{model_name}'] = pred_count
-                            row_data[f'Pred_{model_name}_Pct'] = (pred_count / total_pixels) * 100
+                            # Get prediction
+                            with torch.no_grad():
+                                pred = model(input_tensor).output.squeeze().detach().cpu().numpy()
+                                pred_cat = pred.argmax(axis=0)
+                            
+                            # Store prediction in the full prediction array
+                            predictions[model_name][y_start:y_end, x_start:x_end] = pred_cat
                         
-                        # Add this row to the overall pixel counts DataFrame
-                        overall_pixel_counts_df = pd.concat([overall_pixel_counts_df, pd.DataFrame([row_data])], ignore_index=True)
-                    
-                    # Generate a sample visualization for this window
-                    if window_idx % 5 == 0:  # Only visualize every 5th window to avoid too many images
-                        plot_sample_predictions(
-                            dem, slope, flood_cat, 
-                            window_predictions, 
-                            list(model_paths.keys()), 
-                            output_dir,
-                            window_idx=window_idx,
-                            rainfall_level=rainfall_level
-                        )
-        
-        # Store results for this rainfall level
-        all_rainfall_results[rainfall_level] = {
-            'results': rainfall_results,
-            'predictions': rainfall_predictions,
-            'pixel_counts': rainfall_pixel_counts
-        }
-        
-        # Calculate average metrics across all windows for this rainfall level
-        if rainfall_results:
-            # Aggregate results across windows
-            avg_results = []
-            for model_idx in range(len(model_paths)):
-                avg_jaccard = {
-                    'binary': np.mean([window_results[model_idx]['binary'] for window_results in rainfall_results]),
-                    'no_flood': np.mean([window_results[model_idx]['no_flood'] for window_results in rainfall_results]),
-                    'nuisance': np.mean([window_results[model_idx]['nuisance'] for window_results in rainfall_results]),
-                    'minor': np.mean([window_results[model_idx]['minor'] for window_results in rainfall_results]),
-                    'medium': np.mean([window_results[model_idx]['medium'] for window_results in rainfall_results]),
-                    'major': np.mean([window_results[model_idx]['major'] for window_results in rainfall_results]),
+                        except Exception as e:
+                            print(f"      Error processing model {model_name} for window {window_idx}: {e}")
+            
+            # Calculate jaccard scores for the entire domain for each model
+            jaccard_scores = {}
+            for model_name, pred in predictions.items():
+                jaccard = calculate_jaccard_scores(flood_cat, pred)
+                jaccard_scores[model_name] = jaccard
+                
+                # Add to region jaccard dataframe
+                region_jaccard_df = pd.concat([region_jaccard_df, pd.DataFrame({
+                    'Rainfall': [rainfall_level],
+                    'Model': [model_name],
+                    'Epochs': [model_epochs[model_name]],
+                    'Jaccard_No_Flood': [jaccard['no_flood']],
+                    'Jaccard_Flood': [jaccard['binary']],
+                    'Jaccard_Nuisance': [jaccard['nuisance']],
+                    'Jaccard_Minor': [jaccard['minor']],
+                    'Jaccard_Medium': [jaccard['medium']],
+                    'Jaccard_Major': [jaccard['major']]
+                })], ignore_index=True)
+            
+            # Count pixels for ground truth and each model prediction
+            gt_counts, total_pixels = count_pixels_by_category(flood_cat)
+            model_counts = {model_name: count_pixels_by_category(pred)[0] 
+                           for model_name, pred in predictions.items()}
+            
+            # Add pixel counts to dataframe
+            categories = ['No Flood', 'Nuisance', 'Minor', 'Medium', 'Major', 'Total Flood']
+            for i, category in enumerate(categories):
+                if i < 5:  # Regular flood categories
+                    gt_count = gt_counts[i]
+                else:  # Total flood (all non-zero categories)
+                    gt_count = gt_counts['flood']
+                
+                row_data = {
+                    'Rainfall': rainfall_level,
+                    'Category': category,
+                    'Ground_Truth': gt_count,
+                    'Ground_Truth_Pct': (gt_count / total_pixels) * 100
                 }
-                avg_results.append(avg_jaccard)
+                
+                # Add model predictions
+                for model_name, counts in model_counts.items():
+                    if i < 5:
+                        pred_count = counts[i]
+                    else:
+                        pred_count = counts['flood']
+                    
+                    row_data[f'Pred_{model_name}'] = pred_count
+                    row_data[f'Pred_{model_name}_Pct'] = (pred_count / total_pixels) * 100
+                
+                # Add row to dataframe
+                pixel_counts_df = pd.concat([pixel_counts_df, pd.DataFrame([row_data])], ignore_index=True)
             
-            # Plot histograms for this rainfall level using the average results
-            plot_histograms(avg_results, list(model_paths.keys()), output_dir, rainfall_level=rainfall_level)
+            # Store results for this rainfall level
+            all_rainfall_results[rainfall_level] = {
+                'dem': dem,
+                'slope': slope,
+                'flood_cat': flood_cat,
+                'predictions': predictions,
+                'jaccard_scores': jaccard_scores,
+                'pixel_counts': {
+                    'ground_truth': gt_counts,
+                    'models': model_counts
+                }
+            }
             
-            # Create a CSV for this rainfall level
-            rainfall_csv_path = os.path.join(output_dir, f'model_evaluation_{rainfall_level}_{timestamp}.csv')
-            rainfall_results_df = pd.DataFrame({
-                'Model': list(model_paths.keys()),
-                'Epochs': [model_epochs[name] for name in model_paths.keys()],
-                'Jaccard_No_Flood': [results['no_flood'] for results in avg_results],
-                'Jaccard_Flood': [results['binary'] for results in avg_results],
-                'Jaccard_Nuisance': [results['nuisance'] for results in avg_results],
-                'Jaccard_Minor': [results['minor'] for results in avg_results],
-                'Jaccard_Moderate': [results['medium'] for results in avg_results],
-                'Jaccard_Major': [results['major'] for results in avg_results]
-            })
-            rainfall_results_df.to_csv(rainfall_csv_path, index=False)
-            print(f"  Results for rainfall level {rainfall_level} saved to {rainfall_csv_path}")
+            # Create visualization of full domain predictions
+            print(f"  Creating visualization for {rainfall_level}...")
+            
+            # Create colormap for flood categories
+            flood_colors = [FLOOD_COLORS[FloodCategory(i)] for i in range(len(FloodCategory))]
+            cmap = ListedColormap(flood_colors)
+            norm = mpl.colors.Normalize(vmin=0, vmax=4)
+            
+            # Create figure with subplots for ground truth and each model prediction
+            n_models = len(models)
+            fig_width = 5 + 5 * n_models
+            fig_height = 12
+            
+            fig, axes = plt.subplots(1, 1 + n_models, figsize=(fig_width, fig_height), constrained_layout=True)
+            if n_models == 0:
+                axes = [axes]
+            
+            # Plot ground truth
+            axes[0].set_title("Ground Truth")
+            im_gt = axes[0].imshow(flood_cat, cmap=cmap, norm=norm)
+            cbar = fig.colorbar(im_gt, ax=axes[0], ticks=range(len(FloodCategory)), fraction=0.04)
+            cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
+            
+            # Plot predictions for each model
+            for i, model_name in enumerate(models.keys()):
+                binary_jaccard = jaccard_scores[model_name]['binary']
+                axes[i+1].set_title(f"{model_name} - Jaccard: {binary_jaccard:.3f}")
+                im = axes[i+1].imshow(predictions[model_name], cmap=cmap, norm=norm)
+                cbar = fig.colorbar(im, ax=axes[i+1], ticks=range(len(FloodCategory)), fraction=0.04)
+                cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
+            
+            # Add title with rainfall information
+            fig.suptitle(f"Full Domain Prediction - Rainfall: {rainfall_level}", fontsize=16)
+            
+            # Save the figure
+            region_viz_path = os.path.join(output_dir, f'domain_prediction_{rainfall_level}_{timestamp}.png')
+            plt.savefig(region_viz_path, dpi=200, bbox_inches='tight')
+            plt.close()
+            
+            # Plot histograms comparing model performances
+            if len(models) > 0:
+                print(f"  Creating performance histograms for {rainfall_level}...")
+                model_results = [jaccard_scores[model_name] for model_name in model_paths.keys()]
+                plot_histograms(model_results, list(model_paths.keys()), output_dir, rainfall_level=rainfall_level)
+        
+        except Exception as e:
+            print(f"  Error processing rainfall level {rainfall_level}: {e}")
     
     # Save the overall results
-    overall_results_df.to_csv(overall_csv_path, index=False)
-    overall_pixel_counts_df.to_csv(overall_pixel_csv_path, index=False)
+    region_jaccard_df.to_csv(region_jaccard_csv_path, index=False)
+    pixel_counts_df.to_csv(pixel_counts_csv_path, index=False)
     
-    print(f"\nOverall results saved to:")
-    print(f"- {overall_csv_path}")
-    print(f"- {overall_pixel_csv_path}")
+    print(f"\nResults saved to:")
+    print(f"- {region_jaccard_csv_path}")
+    print(f"- {pixel_counts_csv_path}")
     print(f"All visualizations saved to {output_dir}")
+    
+    # Plot a comparison of model performances across all rainfall levels
+    if len(all_rainfall_results) > 0:
+        print("\nGenerating comparison plots across rainfall levels...")
+        
+        # Sort rainfall levels by numeric value for proper ordering
+        rainfall_numeric = [int(r.split('mm')[0]) for r in RAINFALL_LEVELS]
+        sorted_indices = np.argsort(rainfall_numeric)
+        sorted_rainfall = [RAINFALL_LEVELS[i] for i in sorted_indices]
+        
+        # Line plot of Jaccard scores by rainfall level
+        plt.figure(figsize=(12, 8))
+        
+        for model_name in models.keys():
+            model_data = region_jaccard_df[region_jaccard_df['Model'] == model_name]
+            binary_scores = []
+            
+            for rainfall in sorted_rainfall:
+                rainfall_row = model_data[model_data['Rainfall'] == rainfall]
+                if not rainfall_row.empty:
+                    binary_scores.append(rainfall_row['Jaccard_Flood'].values[0])
+                else:
+                    binary_scores.append(np.nan)
+            
+            plt.plot(sorted_rainfall, binary_scores, marker='o', linewidth=2, label=model_name)
+        
+        plt.xlabel('Rainfall Level')
+        plt.ylabel('Jaccard Score (Binary Flood)')
+        plt.title('Flood Detection Performance by Rainfall Level')
+        plt.grid(True)
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(output_dir, f'rainfall_comparison_jaccard_{timestamp}.png'), 
+                    dpi=300, bbox_inches='tight')
+        plt.close()
 
 if __name__ == "__main__":
     main()
