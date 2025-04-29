@@ -27,7 +27,7 @@ from terratorch.tasks import SemanticSegmentationTask
 BUFFER = 10
 
 # Import model arguments from task_class.py
-from task_class import model_args_res50, model_args_res101, model_args_tiny, model_args_100, model_args_300, model_args_600
+from task_class import model_args_res50, model_args_res101, model_args_res152, model_args_tiny, model_args_100, model_args_300, model_args_600
 
 # Import the model paths
 from model_pth import FloodCategory as ModelPaths
@@ -100,6 +100,8 @@ def load_model(checkpoint_path, model_type):
         model_args= model_args_res50
     elif model_type == 'RES101':
         model_args= model_args_res101
+    elif model_type == 'RES152':
+        model_args= model_args_res152
     elif model_type == 'TINY':
         model_args = model_args_tiny
     elif model_type == '100M':
@@ -381,13 +383,13 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Create output directory if it doesn't exist
-    output_dir = os.path.join(os.path.dirname(__file__), 'test_results')
-    os.makedirs(output_dir, exist_ok=True)
-    
     # Test parameters
-    domain = 'HOU001'  # Domain to test
+    domain = 'HOU007'  # Domain to test
     crop_size = 512    # Size of each window (should match model input size)
+
+    # Create output directory if it doesn't exist
+    output_dir = os.path.join(os.path.dirname(__file__), f'test_results_{domain}')
+    os.makedirs(output_dir, exist_ok=True)
     
     # Dictionary to store model paths and names
     model_paths = {
@@ -593,9 +595,10 @@ def main():
             
             # Create figure with appropriate size
             fig_width = 15  # 5 inches per column, 3 columns
-            fig_height = 5 * rows  # 5 inches per row
+            fig_height = 3.5 * rows  # 5 inches per row
             
-            fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height), constrained_layout=True)
+            # Use constrained_layout=False so we can adjust spacing manually
+            fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height), constrained_layout=False)
             
             # Flatten axes for easier indexing
             axes = axes.flatten() if rows > 1 else axes
@@ -607,7 +610,7 @@ def main():
             # Plot ground truth
             axes[0].set_title("Ground Truth")
             im_gt = axes[0].imshow(flood_cat, cmap=cmap, norm=norm)
-            cbar = fig.colorbar(im_gt, ax=axes[0], ticks=range(len(FloodCategory)), fraction=0.05)
+            cbar = fig.colorbar(im_gt, ax=axes[0], ticks=range(len(FloodCategory)), fraction=0.046)
             cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
             
             # Plot predictions for each model
@@ -615,11 +618,16 @@ def main():
                 binary_jaccard = jaccard_scores[model_name]['binary']
                 axes[i+1].set_title(f"{model_name} - Jaccard: {binary_jaccard:.3f}")
                 im = axes[i+1].imshow(predictions[model_name], cmap=cmap, norm=norm)
-                cbar = fig.colorbar(im, ax=axes[i+1], ticks=range(len(FloodCategory)), fraction=0.05)
+                cbar = fig.colorbar(im, ax=axes[i+1], ticks=range(len(FloodCategory)), fraction=0.046)
                 cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
             
             # Add title with rainfall information
-            fig.suptitle(f"Full Domain Prediction - Rainfall: {rainfall_level}", fontsize=16)
+            fig.suptitle(f"Full Domain Prediction - Rainfall: {rainfall_level}", fontsize=16, y=0.98)
+
+            plt.subplots_adjust(wspace=0.3, hspace=0.3)
+            
+            # Use tight layout to minimize white space
+            plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave space for the suptitle
             
             # Save the figure
             region_viz_path = os.path.join(output_dir, f'domain_prediction_{rainfall_level}_{timestamp}.png')
