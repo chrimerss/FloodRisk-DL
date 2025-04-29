@@ -19,6 +19,7 @@ import random
 from sklearn.metrics import jaccard_score
 import seaborn as sns
 from collections import defaultdict
+import time
 
 from terratorch.tasks import SemanticSegmentationTask
 
@@ -26,7 +27,7 @@ from terratorch.tasks import SemanticSegmentationTask
 BUFFER = 10
 
 # Import model arguments from task_class.py
-from task_class import model_args_tiny, model_args_100, model_args_300, model_args_600
+from task_class import model_args_res50, model_args_res101, model_args_tiny, model_args_100, model_args_300, model_args_600
 
 # Import the model paths
 from model_pth import FloodCategory as ModelPaths
@@ -95,7 +96,11 @@ def load_model(checkpoint_path, model_type):
         model_type: Type of model ('TINY', '100M', '300M', or '600M')
     """
     # Select the appropriate model arguments based on model type
-    if model_type == 'TINY':
+    if model_type == 'RES50':
+        model_args= model_args_res50
+    elif model_type == 'RES101':
+        model_args= model_args_res101
+    elif model_type == 'TINY':
         model_args = model_args_tiny
     elif model_type == '100M':
         model_args = model_args_100
@@ -113,19 +118,33 @@ def load_model(checkpoint_path, model_type):
     class_weights = [0.5, 1.0, 1.0, 1.0, 1.0]
     
     # Create a temporary model to load from checkpoint
-    temp_model = SemanticSegmentationTask(
-        model_args=model_args,
-        model_factory="EncoderDecoderFactory",
-        loss="ce",
-        optimizer="AdamW",
-        optimizer_hparams={"weight_decay": 0.05},
-        class_names=class_names,
-        class_weights=class_weights,
-        lr=1e-4,
-        ignore_index=-1,
-        freeze_backbone=False,
-        plot_on_val=True
-    )
+    if model_type.startswith('RES'):
+        temp_model= SemanticSegmentationTask(
+            model_args=model_args,
+            model_factory="SMPModelFactory",
+            loss="ce",
+            lr=1e-4,
+            ignore_index=-1,
+            optimizer="AdamW",
+            optimizer_hparams={"weight_decay": 0.05},
+            freeze_backbone=False,
+            class_names=class_names,
+            class_weights=class_weights
+        )
+    else:
+        temp_model = SemanticSegmentationTask(
+            model_args=model_args,
+            model_factory="EncoderDecoderFactory",
+            loss="ce",
+            optimizer="AdamW",
+            optimizer_hparams={"weight_decay": 0.05},
+            class_names=class_names,
+            class_weights=class_weights,
+            lr=1e-4,
+            ignore_index=-1,
+            freeze_backbone=False,
+            plot_on_val=True
+        )
     
     # Load the actual model from checkpoint
     model = SemanticSegmentationTask.load_from_checkpoint(
@@ -358,6 +377,7 @@ def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
 
 def main():
     # Set up device for inference
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -371,6 +391,8 @@ def main():
     
     # Dictionary to store model paths and names
     model_paths = {
+        'RES50': ModelPaths.MODEL_RES50.value,
+        'RES101': ModelPaths.MODEL_RES101.value,
         'TINY': ModelPaths.MODEL_TINY.value,
         '100M': ModelPaths.MODEL_100M.value,
         '300M': ModelPaths.MODEL_300M.value,
@@ -423,6 +445,7 @@ def main():
     
     # Process each rainfall level
     for rainfall_level in RAINFALL_LEVELS:
+        time_start= time.time()
         print(f"\nProcessing rainfall level: {rainfall_level}")
         
         try:
@@ -486,7 +509,9 @@ def main():
                         
                         except Exception as e:
                             print(f"      Error processing model {model_name} for window {window_idx}: {e}")
-            
+            time_end= time.time()
+            proc_time= (time_end - time_start)
+            print(f'Processing time: {proc_time:.1f} seconds')
             # Calculate jaccard scores for the entire domain for each model
             jaccard_scores = {}
             for model_name, pred in predictions.items():
@@ -562,17 +587,27 @@ def main():
             
             # Create figure with subplots for ground truth and each model prediction
             n_models = len(models)
-            fig_width = 5 + 5 * n_models
-            fig_height = 12
+            total_plots = n_models + 1  # +1 for ground truth
+            cols = 3  # Fixed number of columns
+            rows = (total_plots + cols - 1) // cols  # Ceiling division to calculate needed rows
             
-            fig, axes = plt.subplots(1, 1 + n_models, figsize=(fig_width, fig_height), constrained_layout=True)
-            if n_models == 0:
-                axes = [axes]
+            # Create figure with appropriate size
+            fig_width = 15  # 5 inches per column, 3 columns
+            fig_height = 5 * rows  # 5 inches per row
+            
+            fig, axes = plt.subplots(rows, cols, figsize=(fig_width, fig_height), constrained_layout=True)
+            
+            # Flatten axes for easier indexing
+            axes = axes.flatten() if rows > 1 else axes
+            
+            # Hide any unused subplots
+            for i in range(total_plots, len(axes)):
+                axes[i].axis('off')
             
             # Plot ground truth
             axes[0].set_title("Ground Truth")
             im_gt = axes[0].imshow(flood_cat, cmap=cmap, norm=norm)
-            cbar = fig.colorbar(im_gt, ax=axes[0], ticks=range(len(FloodCategory)), fraction=0.04)
+            cbar = fig.colorbar(im_gt, ax=axes[0], ticks=range(len(FloodCategory)), fraction=0.05)
             cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
             
             # Plot predictions for each model
@@ -580,7 +615,7 @@ def main():
                 binary_jaccard = jaccard_scores[model_name]['binary']
                 axes[i+1].set_title(f"{model_name} - Jaccard: {binary_jaccard:.3f}")
                 im = axes[i+1].imshow(predictions[model_name], cmap=cmap, norm=norm)
-                cbar = fig.colorbar(im, ax=axes[i+1], ticks=range(len(FloodCategory)), fraction=0.04)
+                cbar = fig.colorbar(im, ax=axes[i+1], ticks=range(len(FloodCategory)), fraction=0.05)
                 cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
             
             # Add title with rainfall information

@@ -67,6 +67,24 @@ model_args_600 = {
     "num_classes": 5
 }
 
+model_args_res50 = {
+        "backbone":"resnet50", # see smp_encoders.keys()
+        'model': 'UnetPlusPlus', # 'DeepLabV3', 'DeepLabV3Plus', 'FPN', 'Linknet', 'MAnet', 'PAN', 'PSPNet', 'Unet', 'UnetPlusPlus' 
+        "bands": ["BLUE", "NIR_BROAD", "SWIR_1"],
+        "in_channels": 3,
+        "num_classes": 5,
+        "pretrained": False,
+}
+
+model_args_res101 = {
+        "backbone":"resnet101", # see smp_encoders.keys()
+        'model': 'UnetPlusPlus', # 'DeepLabV3', 'DeepLabV3Plus', 'FPN', 'Linknet', 'MAnet', 'PAN', 'PSPNet', 'Unet', 'UnetPlusPlus' 
+        "bands": ["BLUE", "NIR_BROAD", "SWIR_1"],
+        "in_channels": 3,
+        "num_classes": 5,
+        "pretrained": False,
+}
+
 model_args_unet = {
         "backbone":"resnet152", # see smp_encoders.keys()
         'model': 'UnetPlusPlus', # 'DeepLabV3', 'DeepLabV3Plus', 'FPN', 'Linknet', 'MAnet', 'PAN', 'PSPNet', 'Unet', 'UnetPlusPlus' 
