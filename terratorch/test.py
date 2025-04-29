@@ -395,6 +395,7 @@ def main():
     model_paths = {
         'RES50': ModelPaths.MODEL_RES50.value,
         'RES101': ModelPaths.MODEL_RES101.value,
+        'RES152': ModelPaths.MODEL_RES152.value,
         'TINY': ModelPaths.MODEL_TINY.value,
         '100M': ModelPaths.MODEL_100M.value,
         '300M': ModelPaths.MODEL_300M.value,
