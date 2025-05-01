@@ -263,7 +263,10 @@ def run_inference_with_overlap(model, dem, slope, rainfall, device, crop_size=51
     # Get class with highest probability for each pixel
     final_pred = np.argmax(predictions, axis=0).astype(np.int64)
     
-    return final_pred
+    # Calculate confidence (max probability) for each pixel
+    confidence = np.max(predictions, axis=0)
+    
+    return final_pred, confidence
 
 def main(args):
     # Set up device for inference
@@ -321,17 +324,20 @@ def main(args):
     
     print(f"Processing rainfall levels: {sorted_rainfall}")
     
-    # Create figure for visualization with rainfall scenarios as rows and 2 columns (GT, prediction)
+    # Create figure for visualization with rainfall scenarios as rows and 3 columns (GT, prediction, confidence)
     n_rainfall = len(sorted_rainfall)
     fig_height = 4 * n_rainfall  # 4 inches per row
-    fig_width = 10  # 5 inches per column for 2 columns
+    fig_width = 15  # 5 inches per column for 3 columns
     
-    fig, axes = plt.subplots(n_rainfall, 2, figsize=(fig_width, fig_height))
+    fig, axes = plt.subplots(n_rainfall, 3, figsize=(fig_width, fig_height))
     
     # Create colormap for flood categories
     flood_colors = [FLOOD_COLORS[FloodCategory(i)] for i in range(len(FloodCategory))]
     cmap = ListedColormap(flood_colors)
     norm = mpl.colors.Normalize(vmin=0, vmax=4)
+    
+    # Create colormap for confidence visualization
+    confidence_cmap = plt.cm.YlOrBr
     
     # Process each rainfall level
     for i, rainfall_level in enumerate(sorted_rainfall):
@@ -346,7 +352,7 @@ def main(args):
             print(f"Dataset dimensions: {height} x {width}")
             
             # Run inference with overlapping windows for smoother predictions
-            prediction = run_inference_with_overlap(
+            prediction, confidence = run_inference_with_overlap(
                 model, dem, slope, rainfall, device, 
                 crop_size=crop_size, overlap=overlap
             )
@@ -367,6 +373,12 @@ def main(args):
             ax_pred.set_title(f"{model_type} Prediction - {rainfall_level}")
             im_pred = ax_pred.imshow(prediction[:-crop_size,:-crop_size], cmap=cmap, norm=norm)
             
+            # Plot confidence (logits value)
+            ax_conf = ax_row[2]
+            ax_conf.set_title(f"Prediction Confidence - {rainfall_level}")
+            confidence_display = confidence[:-crop_size,:-crop_size]
+            im_conf = ax_conf.imshow(confidence_display, cmap=confidence_cmap, vmin=0.0, vmax=1.0)
+            
             time_end = time.time()
             proc_time = (time_end - time_start)
             print(f'Processing time for {rainfall_level}: {proc_time:.1f} seconds')
@@ -380,17 +392,27 @@ def main(args):
                 ax_row = axes[i]
             ax_row[0].axis('off')
             ax_row[1].axis('off')
+            ax_row[2].axis('off')
     
-    # Add a common colorbar for all subplots
-    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
+    # Add colorbars with adjusted positions to prevent overlap
+    # First colorbar (flood category)
+    cbar_ax = fig.add_axes([0.91, 0.15, 0.01, 0.7])  # [left, bottom, width, height]
     cbar = fig.colorbar(im_gt, cax=cbar_ax, ticks=range(len(FloodCategory)))
     cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
+    # Move label to top
+    cbar.ax.set_title('Flood Category', pad=10)
+    
+    # Second colorbar (confidence) - moved further to the right
+    cbar_conf_ax = fig.add_axes([0.94, 0.15, 0.01, 0.7])  # [left, bottom, width, height]
+    cbar_conf = fig.colorbar(im_conf, cax=cbar_conf_ax)
+    # Move label to top
+    cbar_conf.ax.set_title('Confidence', pad=10)
     
     # Add a title with domain and model information
     plt.suptitle(f"Flood Predictions for {domain} using {model_type}", fontsize=16, y=0.98)
     
-    # Adjust layout
-    plt.tight_layout(rect=[0, 0, 0.9, 0.95])  # Make room for colorbar and title
+    # Adjust layout with more room for colorbars
+    plt.tight_layout(rect=[0, 0, 0.89, 0.95])  # Make room for colorbar and title
     
     # Save the figure
     output_filename = f"{domain}_{model_type}_predictions_{timestamp}.png"
