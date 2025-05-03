@@ -22,6 +22,7 @@ from collections import defaultdict
 import time
 
 from terratorch.tasks import SemanticSegmentationTask
+from bathtub.bathtub import simple_bathtub_with_rainfall_robust
 
 # Define buffer size for input data
 BUFFER = 10
@@ -212,7 +213,7 @@ def load_full_dataset(domain, rainfall_level, crop_size=512):
         crop_size: Size of the window to use for inference (default: 512)
         
     Returns:
-        dem, slope, rainfall, flood_cat, target (all sliced to multiples of crop_size)
+        dem, slope, rainfall, flood_cat, target (all sliced to multiples of crop_size), dem_mean, dem_std
     """
     input_dir = f'/home/users/li1995/global_flood/UrbanFloods2D/dataset/{domain}'
     dem_input = os.path.join(input_dir, f"{domain}_DEM.tif")
@@ -243,8 +244,12 @@ def load_full_dataset(domain, rainfall_level, crop_size=512):
         flood_cat = flood_cat[BUFFER:-BUFFER, BUFFER:-BUFFER]
         rainfall = rainfall[BUFFER:-BUFFER, BUFFER:-BUFFER]
     
+    # Store the original DEM mean and std before normalizing
+    dem_mean = dem.mean()
+    dem_std = dem.std()
+    
     # Normalize DEM
-    dem = (dem - dem.mean()) / dem.std()
+    dem = (dem - dem_mean) / dem_std
     
     # Calculate how many complete crop_size blocks fit in the dimensions
     height, width = dem.shape
@@ -260,7 +265,7 @@ def load_full_dataset(domain, rainfall_level, crop_size=512):
         flood_cat = flood_cat[:complete_height, :complete_width]
         rainfall = rainfall[:complete_height, :complete_width]
     
-    return dem, slope, rainfall, flood_cat, target
+    return dem, slope, rainfall, flood_cat, target, dem_mean, dem_std
 
 # Function to get the full extent of an image
 def get_image_dimensions(domain):
@@ -377,6 +382,41 @@ def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
     plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
     plt.close()
 
+# Function to run bathtub model
+def run_bathtub_model(dem, rainfall, dem_mean=None, dem_std=None):
+    """Run the bathtub model on the input data.
+    
+    Args:
+        dem: Digital Elevation Model as a 2D array (normalized)
+        rainfall: 2D rainfall field with the same shape as the DEM
+        dem_mean: Original DEM mean before normalization
+        dem_std: Original DEM standard deviation before normalization
+        
+    Returns:
+        water_depth: Water depth predictions from the bathtub model
+        depth_categories: Categorized depth predictions
+    """
+    # Run the bathtub model
+    print("  Running bathtub model...")
+    
+    # Denormalize the DEM using the provided mean and std, or use sensible defaults if not provided
+    if dem_mean is not None and dem_std is not None:
+        # Denormalize using the actual mean and std from the original data
+        dem_denorm = dem * dem_std + dem_mean
+        print(f"  Denormalizing DEM with actual mean={dem_mean:.2f}, std={dem_std:.2f}")
+    else:
+        # Fall back to reasonable defaults if mean and std are not provided
+        dem_denorm = dem * 10 + 100  # Approximate denormalization
+        print(f"  Using default denormalization values (mean=100, std=10)")
+    
+    # Run the bathtub model with rainfall
+    water_depth = simple_bathtub_with_rainfall_robust(dem_denorm, rainfall, buffer=0)
+    
+    # Classify water depths into flood categories
+    depth_categories = classify_depths(water_depth)
+    
+    return water_depth, depth_categories
+
 def main():
     # Set up device for inference
     
@@ -412,6 +452,9 @@ def main():
         except:
             model_epochs[name] = 'unknown'
     
+    # Add bathtub model to the list of models (putting it first)
+    model_epochs['BATHTUB'] = 'N/A'  # No training epochs for bathtub model
+    
     # Load models (do this once outside the loops)
     models = {}
     for model_name, model_path in model_paths.items():
@@ -438,8 +481,9 @@ def main():
         'Rainfall', 'Category', 'Ground_Truth', 'Ground_Truth_Pct'
     ])
     
-    # Add columns for each model to pixel counts dataframe
-    for model_name in model_paths.keys():
+    # Add columns for each model to pixel counts dataframe, with bathtub first
+    all_models = ['BATHTUB'] + list(model_paths.keys())
+    for model_name in all_models:
         pixel_counts_df[f'Pred_{model_name}'] = None
         pixel_counts_df[f'Pred_{model_name}_Pct'] = None
     
@@ -454,15 +498,16 @@ def main():
         try:
             # Load the entire dataset at once (with buffer applied)
             print(f"  Loading full dataset for {domain} with rainfall {rainfall_level}...")
-            dem, slope, rainfall, flood_cat, target = load_full_dataset(domain, rainfall_level)
+            dem, slope, rainfall, flood_cat, target, dem_mean, dem_std = load_full_dataset(domain, rainfall_level)
             
             height, width = dem.shape
             print(f"  Dataset dimensions after applying buffer: {height} x {width}")
             
-            # Create prediction arrays for each model
+            # Create prediction arrays for each model (bathtub first)
             print(f"  Creating prediction arrays...")
-            predictions = {model_name: np.zeros_like(flood_cat, dtype=np.int64) 
-                          for model_name in models.keys()}
+            predictions = {'BATHTUB': np.zeros_like(flood_cat, dtype=np.int64)}
+            for model_name in models.keys():
+                predictions[model_name] = np.zeros_like(flood_cat, dtype=np.int64)
             
             # Calculate how many windows we need to cover the entire image
             n_windows_y = (height - crop_size + 1) // crop_size + (1 if (height - crop_size + 1) % crop_size != 0 else 0)
@@ -495,7 +540,19 @@ def main():
                     slope_window = slope[y_start:y_end, x_start:x_end]
                     rainfall_window = rainfall[y_start:y_end, x_start:x_end]
                     
-                    # Process each model
+                    # Process bathtub model FIRST
+                    try:
+                        # Run bathtub model for this window
+                        print(f"      Running bathtub model for window {window_idx}...")
+                        water_depth, pred_cat = run_bathtub_model(dem_window, rainfall_window, dem_mean, dem_std)
+                        
+                        # Store prediction in the full prediction array
+                        predictions['BATHTUB'][y_start:y_end, x_start:x_end] = pred_cat
+                        
+                    except Exception as e:
+                        print(f"      Error processing bathtub model for window {window_idx}: {e}")
+                    
+                    # Process each ML model second
                     for model_name, model in models.items():
                         try:
                             # Prepare input tensor
@@ -512,26 +569,49 @@ def main():
                         
                         except Exception as e:
                             print(f"      Error processing model {model_name} for window {window_idx}: {e}")
+            
             time_end= time.time()
             proc_time= (time_end - time_start)
             print(f'Processing time: {proc_time:.1f} seconds')
-            # Calculate jaccard scores for the entire domain for each model
+            
+            # Calculate jaccard scores for the entire domain for each model (bathtub first)
             jaccard_scores = {}
+            # Process bathtub first
+            jaccard_scores['BATHTUB'] = calculate_jaccard_scores(flood_cat, predictions['BATHTUB'])
+            
+            # Then process the ML models
             for model_name, pred in predictions.items():
+                if model_name == 'BATHTUB':
+                    continue  # Already processed
                 jaccard = calculate_jaccard_scores(flood_cat, pred)
                 jaccard_scores[model_name] = jaccard
-                
-                # Add to region jaccard dataframe
+            
+            # Add the scores to the region jaccard dataframe (bathtub first)
+            # First add bathtub
+            region_jaccard_df = pd.concat([region_jaccard_df, pd.DataFrame({
+                'Rainfall': [rainfall_level],
+                'Model': ['BATHTUB'],
+                'Epochs': [model_epochs.get('BATHTUB', 'N/A')],
+                'Jaccard_No_Flood': [jaccard_scores['BATHTUB']['no_flood']],
+                'Jaccard_Flood': [jaccard_scores['BATHTUB']['binary']],
+                'Jaccard_Nuisance': [jaccard_scores['BATHTUB']['nuisance']],
+                'Jaccard_Minor': [jaccard_scores['BATHTUB']['minor']],
+                'Jaccard_Medium': [jaccard_scores['BATHTUB']['medium']],
+                'Jaccard_Major': [jaccard_scores['BATHTUB']['major']]
+            })], ignore_index=True)
+            
+            # Then add the ML models
+            for model_name in models.keys():
                 region_jaccard_df = pd.concat([region_jaccard_df, pd.DataFrame({
                     'Rainfall': [rainfall_level],
                     'Model': [model_name],
-                    'Epochs': [model_epochs[model_name]],
-                    'Jaccard_No_Flood': [jaccard['no_flood']],
-                    'Jaccard_Flood': [jaccard['binary']],
-                    'Jaccard_Nuisance': [jaccard['nuisance']],
-                    'Jaccard_Minor': [jaccard['minor']],
-                    'Jaccard_Medium': [jaccard['medium']],
-                    'Jaccard_Major': [jaccard['major']]
+                    'Epochs': [model_epochs.get(model_name, 'N/A')],
+                    'Jaccard_No_Flood': [jaccard_scores[model_name]['no_flood']],
+                    'Jaccard_Flood': [jaccard_scores[model_name]['binary']],
+                    'Jaccard_Nuisance': [jaccard_scores[model_name]['nuisance']],
+                    'Jaccard_Minor': [jaccard_scores[model_name]['minor']],
+                    'Jaccard_Medium': [jaccard_scores[model_name]['medium']],
+                    'Jaccard_Major': [jaccard_scores[model_name]['major']]
                 })], ignore_index=True)
             
             # Count pixels for ground truth and each model prediction
@@ -554,8 +634,10 @@ def main():
                     'Ground_Truth_Pct': (gt_count / total_pixels) * 100
                 }
                 
-                # Add model predictions
-                for model_name, counts in model_counts.items():
+                # Add model predictions (bathtub first)
+                model_order = ['BATHTUB'] + [m for m in model_counts.keys() if m != 'BATHTUB']
+                for model_name in model_order:
+                    counts = model_counts[model_name]
                     if i < 5:
                         pred_count = counts[i]
                     else:
@@ -589,7 +671,7 @@ def main():
             norm = mpl.colors.Normalize(vmin=0, vmax=4)
             
             # Create figure with subplots for ground truth and each model prediction
-            n_models = len(models)
+            n_models = len(models) + 1  # +1 for bathtub model
             total_plots = n_models + 1  # +1 for ground truth
             cols = 3  # Fixed number of columns
             rows = (total_plots + cols - 1) // cols  # Ceiling division to calculate needed rows
@@ -614,8 +696,9 @@ def main():
             cbar = fig.colorbar(im_gt, ax=axes[0], ticks=range(len(FloodCategory)), fraction=0.046)
             cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
             
-            # Plot predictions for each model
-            for i, model_name in enumerate(models.keys()):
+            # Plot predictions for each model (bathtub first)
+            model_names = ['BATHTUB'] + list(models.keys())
+            for i, model_name in enumerate(model_names):
                 binary_jaccard = jaccard_scores[model_name]['binary']
                 axes[i+1].set_title(f"{model_name} - Jaccard: {binary_jaccard:.3f}")
                 im = axes[i+1].imshow(predictions[model_name], cmap=cmap, norm=norm)
@@ -636,10 +719,12 @@ def main():
             plt.close()
             
             # Plot histograms comparing model performances
-            if len(models) > 0:
+            if len(predictions) > 0:
                 print(f"  Creating performance histograms for {rainfall_level}...")
-                model_results = [jaccard_scores[model_name] for model_name in model_paths.keys()]
-                plot_histograms(model_results, list(model_paths.keys()), output_dir, rainfall_level=rainfall_level)
+                # Make sure bathtub is first
+                ordered_model_names = ['BATHTUB'] + [m for m in list(models.keys())]
+                model_results = [jaccard_scores[model_name] for model_name in ordered_model_names]
+                plot_histograms(model_results, ordered_model_names, output_dir, rainfall_level=rainfall_level)
         
         except Exception as e:
             print(f"  Error processing rainfall level {rainfall_level}: {e}")
@@ -665,7 +750,9 @@ def main():
         # Line plot of Jaccard scores by rainfall level
         plt.figure(figsize=(12, 8))
         
-        for model_name in models.keys():
+        # Make sure bathtub is plotted first (will appear first in legend)
+        ordered_models = ['BATHTUB'] + list(models.keys())
+        for model_name in ordered_models:
             model_data = region_jaccard_df[region_jaccard_df['Model'] == model_name]
             binary_scores = []
             
