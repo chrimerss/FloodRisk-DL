@@ -16,6 +16,8 @@ terratorch/output/
 terratorch/wandb/
 terratorch/stored_tokens
 terratorch/token
+terratorch/test_results*
+*.zip
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python

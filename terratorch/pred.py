@@ -17,6 +17,7 @@ from enum import Enum
 from datetime import datetime
 import argparse
 import time
+import json
 
 # Import modules from terratorch
 from terratorch.tasks import SemanticSegmentationTask
@@ -45,7 +46,36 @@ FLOOD_COLORS = {
 }
 
 # Available rainfall levels
-RAINFALL_LEVELS = ["181mm", "162mm", "138mm", "123mm", "110mm", "98mm", "82mm", "70mm", "57mm", "48mm"]
+# RAINFALL_LEVELS = ["181mm", "162mm", "138mm", "123mm", "110mm", "98mm", "82mm", "70mm", "57mm", "48mm"]
+
+with open("/home/users/li1995/global_flood/FloodBench/data/cities_rainfall.json", "r") as f:
+        RAINFALL_DICT = json.load(f)
+
+# 
+    # {
+    #     "City ID": "AUS001",
+    #     "Desc": "Austin d01",
+    #     "100-yr": "121 mm",
+    #     "50-yr": "106 mm",
+    #     "25-yr": "93 mm",
+    #     "10-yr": "76 mm"
+    # },
+
+def extract_rainfall_levels(city_id, data):
+    # Define the preferred order of return periods
+    return_periods_ordered = [
+        "1000-yr", "500-yr", "200-yr", "100-yr", "50-yr",
+        "25-yr", "10-yr", "5-yr", "2-yr", "1-yr"
+    ]
+    
+    for entry in data:
+        if entry["City ID"] == city_id:
+            # Filter and order the rainfall values based on return periods
+            rainfall_levels = [
+                entry[rp].replace(" ", "") for rp in return_periods_ordered if rp in entry
+            ]
+            return rainfall_levels
+    return []
 
 # Function to classify flood depths into categories
 def classify_depths(src):
@@ -278,6 +308,8 @@ def main(args):
     crop_size = 512  # Size of each window
     overlap = args.overlap  # Overlap between windows
     
+    RAINFALL_LEVELS= extract_rainfall_levels(domain, RAINFALL_DICT)
+
     # Create output directory if it doesn't exist
     output_dir = os.path.join(os.path.dirname(__file__), f'pred_results')
     os.makedirs(output_dir, exist_ok=True)
