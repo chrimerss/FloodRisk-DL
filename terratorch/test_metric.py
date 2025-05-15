@@ -69,12 +69,15 @@ with open("/home/users/li1995/global_flood/FloodBench/data/cities_rainfall.json"
     #     "10-yr": "76 mm"
     # },
 
-def extract_rainfall_levels(city_id, data):
+def extract_rainfall_levels(city_id, data, freqs=None):
     # Define the preferred order of return periods
     return_periods_ordered = [
         "1000-yr", "500-yr", "200-yr", "100-yr", "50-yr",
         "25-yr", "10-yr", "5-yr", "2-yr", "1-yr"
     ]
+    if freqs:
+        return_periods_ordered = freqs
+
     
     for entry in data:
         if entry["City ID"] == city_id:

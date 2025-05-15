@@ -18,6 +18,7 @@ terratorch/stored_tokens
 terratorch/token
 terratorch/test_results*
 *.zip
+terratorch/meta_learning_results*
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
