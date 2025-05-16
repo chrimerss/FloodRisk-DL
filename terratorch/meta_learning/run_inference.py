@@ -1,3 +1,6 @@
+#!/usr/bin/env python
+# coding: utf-8
+
 import os
 import sys
 import torch
@@ -10,6 +13,9 @@ from datetime import datetime
 import argparse
 from pathlib import Path
 import joblib
+import rasterio
+from rasterio.transform import Affine
+from rasterio.windows import Window
 
 # Add parent directory to path for imports
 sys.path.append('/home/users/li1995/global_flood/FloodRisk-DL/terratorch')
@@ -34,6 +40,29 @@ from model_pth import FloodCategory as ModelPaths
 
 # Set device
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def create_gaussian_weight_map(crop_size=512, sigma=0.5):
+    """
+    Create a Gaussian weight map for blending window predictions.
+    
+    Args:
+        crop_size: Size of the window (default: 512)
+        sigma: Standard deviation of the Gaussian kernel (default: 0.5)
+        
+    Returns:
+        2D numpy array with Gaussian weights
+    """
+    y = np.linspace(-1, 1, crop_size)
+    x = np.linspace(-1, 1, crop_size)
+    X, Y = np.meshgrid(x, y)
+    distance = np.sqrt(X**2 + Y**2) / np.sqrt(2)
+    
+    # Create Gaussian weight with specified sigma
+    weights = np.exp(-(distance**2) / (2 * sigma**2))
+    
+    # Normalize weights
+    weights = weights / np.max(weights)
+    return weights
 
 def load_meta_model(meta_model_path):
     """
@@ -89,14 +118,18 @@ def load_base_models():
     print(f"Loaded {len(models)} base models.")
     return models
 
-def get_model_predictions(domain, rainfall_level, models):
+def get_model_predictions(domain, rainfall_level, models, window_size=512, overlap=128, sigma=0.5):
     """
-    Get predictions from all base models for a given domain and rainfall level.
+    Get predictions from all base models for a given domain and rainfall level,
+    using Gaussian kernel smoothing at window boundaries.
     
     Args:
         domain: Domain name (e.g., 'HOU001')
         rainfall_level: Rainfall level (e.g., '100mm')
         models: Dictionary of loaded models
+        window_size: Size of the window for processing (default: 512)
+        overlap: Overlap between adjacent windows in pixels (default: 128)
+        sigma: Standard deviation for the Gaussian kernel (default: 0.5)
         
     Returns:
         Dictionary with predictions and metadata
@@ -106,6 +139,24 @@ def get_model_predictions(domain, rainfall_level, models):
         print(f"Loading domain {domain} with rainfall {rainfall_level}...")
         dem, slope, rainfall, flood_cat, target, dem_mean, dem_std = load_full_dataset(domain, rainfall_level)
         
+        # Get metadata for GeoTIFF export
+        input_dir = f'/home/users/li1995/global_flood/UrbanFloods2D/dataset/{domain}'
+        dem_input = os.path.join(input_dir, f"{domain}_DEM.tif")
+        geotiff_meta = None
+        try:
+            with rasterio.open(dem_input) as src:
+                geotiff_meta = {
+                    'crs': src.crs,
+                    'transform': src.transform,
+                    'width': src.width,
+                    'height': src.height,
+                    'count': 1,
+                    'dtype': 'uint8',
+                    'nodata': 255
+                }
+        except Exception as e:
+            print(f"Warning: Could not obtain GeoTIFF metadata from source file: {e}")
+        
         height, width = dem.shape
         print(f"Dataset dimensions: {height} x {width}")
         
@@ -113,27 +164,49 @@ def get_model_predictions(domain, rainfall_level, models):
         predictions = {}
         probs = {}  # For storing class probabilities
         
-        # Process each ML model using fixed 512x512 moving window
-        window_size = 512  # Fixed window size for processing
+        # Get Gaussian weight map for window blending
+        weight_map = create_gaussian_weight_map(window_size, sigma)
         
+        # Calculate stride based on overlap
+        stride = window_size - overlap
+        
+        # Calculate number of windows needed
+        n_windows_y = max(1, int(np.ceil((height - overlap) / stride))) if height > window_size else 1
+        n_windows_x = max(1, int(np.ceil((width - overlap) / stride))) if width > window_size else 1
+        
+        print(f"Using {n_windows_y}x{n_windows_x} windows with size {window_size}, stride={stride}, overlap={overlap}")
+        
+        # Process each ML model
         for model_name, model in models.items():
             try:
-                print(f"  Running {model_name} model with 512x512 moving window...")
-                # Initialize output arrays
-                pred_cat = np.zeros((height, width), dtype=np.int64)
-                probs_out = np.zeros((5, height, width), dtype=np.float32)
+                print(f"  Running {model_name} model with Gaussian smoothing...")
+                # Initialize output arrays for accumulating weighted predictions
+                # We store class probabilities for better blending
+                probs_out = np.zeros((5, height, width), dtype=np.float32)  # Store class probabilities
+                weights_sum = np.zeros((height, width), dtype=np.float32)  # Store accumulated weights
                 
-                # Process image in 512x512 windows with overlap
-                for y in range(0, height, window_size):
-                    y_end = min(y + window_size, height)
-                    
-                    for x in range(0, width, window_size):
-                        x_end = min(x + window_size, width)
+                # Process image in windows with overlap
+                for y_idx in range(n_windows_y):
+                    for x_idx in range(n_windows_x):
+                        # Calculate window coordinates
+                        y_start = min(y_idx * stride, height - window_size) if height > window_size else 0
+                        x_start = min(x_idx * stride, width - window_size) if width > window_size else 0
+                        y_end = min(y_start + window_size, height)
+                        x_end = min(x_start + window_size, width)
                         
-                        # Extract window
-                        dem_window = dem[y:y_end, x:x_end]
-                        slope_window = slope[y:y_end, x:x_end]
-                        rainfall_window = rainfall[y:y_end, x:x_end]
+                        # Extract window data
+                        dem_window = dem[y_start:y_end, x_start:x_end]
+                        slope_window = slope[y_start:y_end, x_start:x_end]
+                        rainfall_window = rainfall[y_start:y_end, x_start:x_end]
+                        
+                        # Handle window size if smaller than crop_size
+                        window_h, window_w = dem_window.shape
+                        if window_h < window_size or window_w < window_size:
+                            pad_h = max(0, window_size - window_h)
+                            pad_w = max(0, window_size - window_w)
+                            dem_window = np.pad(dem_window, ((0, pad_h), (0, pad_w)), mode='reflect')
+                            slope_window = np.pad(slope_window, ((0, pad_h), (0, pad_w)), mode='reflect')
+                            rainfall_window = np.pad(rainfall_window, ((0, pad_h), (0, pad_w)), mode='reflect')
                         
                         # Prepare input tensor
                         model_input = np.stack([dem_window, slope_window, rainfall_window])
@@ -143,25 +216,38 @@ def get_model_predictions(domain, rainfall_level, models):
                         with torch.no_grad():
                             output = model(input_tensor)
                             pred = output.output.squeeze().detach().cpu().numpy()
-                            window_pred_cat = pred.argmax(axis=0)
-                            
-                            # Store predictions and probabilities in the full array
-                            pred_cat[y:y_end, x:x_end] = window_pred_cat
-                            
-                            # Handle different shapes of probabilities
-                            if len(pred.shape) == 3:  # (classes, height, width)
-                                probs_out[:, y:y_end, x:x_end] = pred
-                            else:  # Handle other formats if needed
-                                for c in range(min(5, pred.shape[0])):
-                                    probs_out[c, y:y_end, x:x_end] = pred[c]
+                        
+                        # Extract actual window dimensions
+                        window_h = y_end - y_start
+                        window_w = x_end - x_start
+                        current_weight = weight_map[:window_h, :window_w]
+                        
+                        # Apply weights to prediction probabilities and add to accumulated predictions
+                        for c in range(pred.shape[0]):  # For each class channel
+                            weighted_pred = pred[c, :window_h, :window_w] * current_weight
+                            probs_out[c, y_start:y_end, x_start:x_end] += weighted_pred
+                        
+                        # Add weights to sum for later normalization
+                        weights_sum[y_start:y_end, x_start:x_end] += current_weight
                         
                         # Clear CUDA cache to free memory
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                 
+                # Normalize the predictions by the weight sum
+                for c in range(probs_out.shape[0]):
+                    probs_out[c] = np.divide(probs_out[c], weights_sum, 
+                                            out=np.zeros_like(probs_out[c]), 
+                                            where=weights_sum > 0)
+                
+                # Get class with highest probability for each pixel
+                pred_cat = np.argmax(probs_out, axis=0).astype(np.int64)
+                
                 # Store results
                 predictions[model_name] = pred_cat
                 probs[model_name] = probs_out
+                
+                print(f"  Completed {model_name} model inference")
                 
             except Exception as e:
                 print(f"  Error running model {model_name}: {e}")
@@ -186,7 +272,8 @@ def get_model_predictions(domain, rainfall_level, models):
             'probabilities': probs,
             'jaccard_scores': jaccard_scores,
             'dem_mean': dem_mean,
-            'dem_std': dem_std
+            'dem_std': dem_std,
+            'geotiff_meta': geotiff_meta
         }
     
     except Exception as e:
@@ -203,7 +290,8 @@ def get_model_predictions(domain, rainfall_level, models):
             'probabilities': {},
             'jaccard_scores': {},
             'dem_mean': 0,
-            'dem_std': 1
+            'dem_std': 1,
+            'geotiff_meta': None
         }
 
 def extract_features(pred_result):
@@ -251,7 +339,8 @@ def extract_features(pred_result):
     
     return X
 
-def run_meta_model_inference(domain, rainfall_level, meta_model, base_models, output_dir):
+def run_meta_model_inference(domain, rainfall_level, meta_model, base_models, output_dir, 
+                           window_size=512, overlap=128, sigma=0.5, save_geotiffs=True):
     """
     Run inference using the meta-model on a specific domain and rainfall level.
     
@@ -261,14 +350,19 @@ def run_meta_model_inference(domain, rainfall_level, meta_model, base_models, ou
         meta_model: Loaded meta-model
         base_models: Dictionary of loaded base models
         output_dir: Directory to save results
+        window_size: Size of the window for processing (default: 512)
+        overlap: Overlap between adjacent windows (default: 128)
+        sigma: Sigma for Gaussian kernel (default: 0.5)
+        save_geotiffs: Whether to save predictions as GeoTIFF files (default: True)
         
     Returns:
         Dictionary with meta-model evaluation results
     """
     print(f"\nRunning meta-model inference on {domain}, rainfall {rainfall_level}")
     
-    # Get base model predictions
-    pred_result = get_model_predictions(domain, rainfall_level, base_models)
+    # Get base model predictions with Gaussian kernel smoothing
+    pred_result = get_model_predictions(domain, rainfall_level, base_models, 
+                                      window_size=window_size, overlap=overlap, sigma=sigma)
     
     if pred_result['dem'].size == 0:
         print(f"No valid predictions for {domain}, {rainfall_level}. Skipping.")
@@ -309,6 +403,36 @@ def run_meta_model_inference(domain, rainfall_level, meta_model, base_models, ou
         print("\nBase model performance:")
         for model_name, jaccard in pred_result['jaccard_scores'].items():
             print(f"{model_name} - Binary Jaccard: {jaccard['binary']:.4f}, Binary F1: {jaccard['binary_f1']:.4f}")
+        
+        # Save predictions as GeoTIFF files
+        if save_geotiffs and pred_result['geotiff_meta'] is not None:
+            print("\nSaving predictions as GeoTIFF files...")
+            geotiff_dir = os.path.join(output_dir, 'geotiffs', domain, rainfall_level)
+            os.makedirs(geotiff_dir, exist_ok=True)
+            
+            # Save meta-model prediction
+            meta_geotiff_path = os.path.join(geotiff_dir, f'meta_model_prediction.tif')
+            save_geotiff(meta_pred, meta_geotiff_path, pred_result['geotiff_meta'])
+            
+            # Save ground truth
+            gt_geotiff_path = os.path.join(geotiff_dir, f'ground_truth.tif')
+            save_geotiff(pred_result['flood_cat'], gt_geotiff_path, pred_result['geotiff_meta'])
+            
+            # Save base model predictions (top 3 only to save space)
+            base_models_to_save = 3
+            if pred_result['jaccard_scores']:
+                # Sort models by binary F1 score
+                model_scores = [(model, scores['binary_f1']) 
+                               for model, scores in pred_result['jaccard_scores'].items()]
+                model_scores.sort(key=lambda x: x[1], reverse=True)
+                
+                # Save top models
+                for i, (model_name, _) in enumerate(model_scores[:base_models_to_save]):
+                    model_geotiff_path = os.path.join(geotiff_dir, f'{model_name}_prediction.tif')
+                    save_geotiff(pred_result['predictions'][model_name], 
+                               model_geotiff_path, pred_result['geotiff_meta'])
+            
+            print(f"Saved GeoTIFF files to {geotiff_dir}")
         
         return pred_result
     
@@ -433,6 +557,59 @@ def create_visualization(domain, rainfall_level, pred_result, meta_jaccard, outp
         import traceback
         traceback.print_exc()
 
+def save_geotiff(data, output_path, meta=None, nodata=255):
+    """
+    Save a prediction array as a GeoTIFF file.
+    
+    Args:
+        data: 2D numpy array with prediction data
+        output_path: Path to save the GeoTIFF file
+        meta: Dictionary with metadata for the GeoTIFF (crs, transform, etc.)
+        nodata: Value to use for nodata pixels (default: 255)
+    """
+    try:
+        print(f"Saving GeoTIFF to {output_path}")
+        
+        if meta is None:
+            # Create default metadata if none provided
+            height, width = data.shape
+            meta = {
+                'driver': 'GTiff',
+                'height': height,
+                'width': width,
+                'count': 1,
+                'dtype': 'uint8',
+                'crs': None,
+                'transform': Affine(1.0, 0.0, 0.0, 0.0, 1.0, 0.0),  # Default transform
+                'nodata': nodata
+            }
+        else:
+            # Ensure we have all required metadata
+            meta = meta.copy()
+            meta.update({
+                'driver': 'GTiff',
+                'count': 1,
+                'dtype': 'uint8',
+                'nodata': nodata
+            })
+        
+        # Convert to uint8 (required for most GIS software to recognize categorical data)
+        data_uint8 = data.astype(np.uint8)
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Write to GeoTIFF
+        with rasterio.open(output_path, 'w', **meta) as dst:
+            dst.write(data_uint8, 1)
+            
+        print(f"Successfully saved GeoTIFF to {output_path}")
+        
+    except Exception as e:
+        print(f"Error saving GeoTIFF: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
 def save_results(domain, rainfall_level, pred_result, output_dir):
     """
     Save inference results to CSV files.
@@ -507,6 +684,8 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
     
     print(f"Output directory: {output_dir}")
+    print(f"Window size: {args.window_size}, Overlap: {args.overlap}, Sigma: {args.sigma}")
+    print(f"Save GeoTIFF files: {args.save_geotiffs}")
     
     # Load meta-model
     meta_model = load_meta_model(args.meta_model)
@@ -543,7 +722,14 @@ def main(args):
             print(f"Processing domain: {domain}, rainfall: {rainfall_level}")
             print(f"{'='*80}")
             
-            result = run_meta_model_inference(domain, rainfall_level, meta_model, base_models, output_dir)
+            # Run meta-model inference with Gaussian kernel smoothing
+            result = run_meta_model_inference(
+                domain, rainfall_level, meta_model, base_models, output_dir,
+                window_size=args.window_size, 
+                overlap=args.overlap,
+                sigma=args.sigma,
+                save_geotiffs=args.save_geotiffs
+            )
             
             if result:
                 save_results(domain, rainfall_level, result, output_dir)
@@ -568,6 +754,17 @@ if __name__ == "__main__":
                         help='Comma-separated list of domains to process (e.g., HOU001,SF001)')
     parser.add_argument('--rainfall_levels', type=str, default=None,
                         help='Comma-separated list of rainfall levels to process (e.g., 100mm,200mm)')
+    parser.add_argument('--window_size', type=int, default=512,
+                        help='Size of window for processing (default: 512)')
+    parser.add_argument('--overlap', type=int, default=128,
+                        help='Overlap between adjacent windows in pixels (default: 128)')
+    parser.add_argument('--sigma', type=float, default=0.5,
+                        help='Standard deviation for Gaussian kernel (default: 0.5)')
+    parser.add_argument('--save_geotiffs', action='store_true',
+                        help='Save prediction results as GeoTIFF files')
+    parser.add_argument('--no_save_geotiffs', dest='save_geotiffs', action='store_false',
+                        help='Do not save prediction results as GeoTIFF files')
+    parser.set_defaults(save_geotiffs=True)
     
     args = parser.parse_args()
     main(args)

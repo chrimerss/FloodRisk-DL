@@ -21,7 +21,7 @@ import pickle
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import jaccard_score
+from sklearn.metrics import jaccard_score, f1_score
 import joblib
 
 # Import necessary TerraTorch components
@@ -127,12 +127,7 @@ class MetaLearningModel:
     
     def _get_rainfall_levels(self, domain):
         """Get rainfall levels for a domain."""
-
-        #only do four levels of rainfall
-        valid_levels= ['100-yr', '50-yr', '25-yr', '10-yr']
-        rainfall_levels= extract_rainfall_levels(domain, RAINFALL_DICT, freqs=valid_levels)
-        
-        return rainfall_levels
+        return extract_rainfall_levels(domain, RAINFALL_DICT)
     
     def _get_model_predictions(self, domain, rainfall_level):
         """
@@ -577,22 +572,33 @@ class MetaLearningModel:
         # Evaluate on validation set
         val_pred = self.meta_model.predict(X_val)
         
-        # Calculate Jaccard scores for each class
+        # Calculate Jaccard scores and F1 scores for each class
         jaccard_scores = {}
+        f1_scores = {}
         for i in range(5):  # 5 flood categories
             # Create binary masks for this class
             true_cls = (y_val == i).astype(int)
             pred_cls = (val_pred == i).astype(int)
             
-            # Calculate Jaccard score for this class
+            # Calculate Jaccard score and F1 score for this class
             jaccard_scores[i] = jaccard_score(true_cls, pred_cls, average='binary')
+            f1_scores[i] = f1_score(true_cls, pred_cls, average='binary')
         
-        # Calculate binary Jaccard score (flood vs no-flood)
+        # Calculate binary Jaccard score and F1 score (flood vs no-flood)
         true_binary = (y_val > 0).astype(int)
         pred_binary = (val_pred > 0).astype(int)
         binary_jaccard = jaccard_score(true_binary, pred_binary, average='binary')
+        binary_f1 = f1_score(true_binary, pred_binary, average='binary')
         
-        print("Validation Jaccard Scores:")
+        print("Validation F1 Scores:")
+        print(f"  Binary (Flood vs No-Flood): {binary_f1:.4f}")
+        print(f"  No Flood (Cat 0): {f1_scores[0]:.4f}")
+        print(f"  Nuisance Flood (Cat 1): {f1_scores[1]:.4f}")
+        print(f"  Minor Flood (Cat 2): {f1_scores[2]:.4f}")
+        print(f"  Medium Flood (Cat 3): {f1_scores[3]:.4f}")
+        print(f"  Major Flood (Cat 4): {f1_scores[4]:.4f}")
+        
+        print("\nValidation Jaccard Scores:")
         print(f"  Binary (Flood vs No-Flood): {binary_jaccard:.4f}")
         print(f"  No Flood (Cat 0): {jaccard_scores[0]:.4f}")
         print(f"  Nuisance Flood (Cat 1): {jaccard_scores[1]:.4f}")
@@ -608,7 +614,9 @@ class MetaLearningModel:
         # Save validation results
         val_results = {
             'binary_jaccard': binary_jaccard,
+            'binary_f1': binary_f1,
             'class_jaccard': jaccard_scores,
+            'class_f1': f1_scores,
             'training_time': training_time,
             'model_type': model_type,
             'max_depth': max_depth
@@ -930,15 +938,15 @@ class MetaLearningModel:
             axes[0].imshow(flood_cat, cmap=cmap, vmin=0, vmax=4)
             
             # Plot meta-model prediction
-            binary_jaccard = meta_jaccard['binary']
-            axes[1].set_title(f"Meta-Model - Jaccard: {binary_jaccard:.3f}")
+            binary_f1 = meta_jaccard['binary_f1']
+            axes[1].set_title(f"Meta-Model - F1: {binary_f1:.3f}")
             axes[1].imshow(meta_pred, cmap=cmap, vmin=0, vmax=4)
             
             # Plot base model predictions
             for i, (model_name, pred) in enumerate(base_preds.items()):
                 idx = i + 2  # Offset for ground truth and meta-model
-                binary_jaccard = base_jaccard[model_name]['binary']
-                axes[idx].set_title(f"{model_name} - Jaccard: {binary_jaccard:.3f}")
+                binary_f1 = base_jaccard[model_name]['binary_f1']
+                axes[idx].set_title(f"{model_name} - F1: {binary_f1:.3f}")
                 axes[idx].imshow(pred, cmap=cmap, vmin=0, vmax=4)
             
             # Add overall title

@@ -16,7 +16,7 @@ from pathlib import Path
 from enum import Enum
 from datetime import datetime
 import random
-from sklearn.metrics import jaccard_score
+from sklearn.metrics import jaccard_score, f1_score
 import seaborn as sns
 from collections import defaultdict
 import time
@@ -320,9 +320,9 @@ def get_image_dimensions(domain):
     
     return height, width
 
-# Function to calculate Jaccard scores
+# Function to calculate Jaccard and F1 scores
 def calculate_jaccard_scores(true, pred):
-    """Calculate Jaccard scores for different flood categories."""
+    """Calculate Jaccard and F1 scores for different flood categories."""
     
     # Convert to binary (flood vs no flood)
     true_binary = (true > 0).astype(int)
@@ -330,24 +330,34 @@ def calculate_jaccard_scores(true, pred):
     
     # Calculate Jaccard score for binary classification
     binary_jaccard = jaccard_score(true_binary.flatten(), pred_binary.flatten(), average='binary')
+    # Calculate F1 score for binary classification
+    binary_f1 = f1_score(true_binary.flatten(), pred_binary.flatten(), average='binary')
     
-    # Calculate Jaccard scores for each class
+    # Calculate Jaccard and F1 scores for each class
     class_jaccard = {}
+    class_f1 = {}
     for cls in range(5):  # 0, 1, 2, 3, 4
         # For each class, create binary masks
         true_cls = (true == cls).astype(int)
         pred_cls = (pred == cls).astype(int)
         
-        # Calculate Jaccard score for this class
+        # Calculate Jaccard and F1 score for this class
         class_jaccard[cls] = jaccard_score(true_cls.flatten(), pred_cls.flatten(), average='binary')
+        class_f1[cls] = f1_score(true_cls.flatten(), pred_cls.flatten(), average='binary')
     
     return {
         'binary': binary_jaccard,
+        'binary_f1': binary_f1,
         'no_flood': class_jaccard[0],  # Class 0: NO_FLOOD
+        'no_flood_f1': class_f1[0],    # F1 score for NO_FLOOD
         'nuisance': class_jaccard[1],  # Class 1: NUISANCE
+        'nuisance_f1': class_f1[1],    # F1 score for NUISANCE
         'minor': class_jaccard[2],     # Class 2: MINOR
+        'minor_f1': class_f1[2],       # F1 score for MINOR
         'medium': class_jaccard[3],    # Class 3: MEDIUM
-        'major': class_jaccard[4]      # Class 4: MAJOR
+        'medium_f1': class_f1[3],      # F1 score for MEDIUM
+        'major': class_jaccard[4],     # Class 4: MAJOR
+        'major_f1': class_f1[4]        # F1 score for MAJOR
     }
 
 # Function to plot histograms
@@ -355,7 +365,7 @@ def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
     """Plot histograms comparing model results."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 1. Plot histogram of binary classification (no flood vs flood)
+    # 1. Plot histogram of binary classification (no flood vs flood) using Jaccard Score
     plt.figure(figsize=(10, 6))
     binary_data = {
         'No Flood': [results['no_flood'] for results in all_results],
@@ -370,7 +380,7 @@ def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
     ax.bar(x + width/2, binary_data['Flood'], width, label='Flood')
     
     ax.set_ylabel('Jaccard Score')
-    title = 'Binary Classification Performance by Model'
+    title = 'Binary Classification Performance by Model (Jaccard)'
     if rainfall_level:
         title += f' (Rainfall: {rainfall_level})'
     ax.set_title(title)
@@ -379,14 +389,42 @@ def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
     ax.legend()
     
     plt.tight_layout()
-    filename = f'binary_histogram_{timestamp}'
+    filename = f'binary_histogram_jaccard_{timestamp}'
     if rainfall_level:
         filename += f'_{rainfall_level}'
     filename += '.png'
     plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
     plt.close()
     
-    # 2. Plot stacked histogram of flood categories
+    # 1b. Plot histogram of binary classification (no flood vs flood) using F1 Score
+    plt.figure(figsize=(10, 6))
+    binary_f1_data = {
+        'No Flood': [results['no_flood_f1'] for results in all_results],
+        'Flood': [results['binary_f1'] for results in all_results]
+    }
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    ax.bar(x - width/2, binary_f1_data['No Flood'], width, label='No Flood')
+    ax.bar(x + width/2, binary_f1_data['Flood'], width, label='Flood')
+    
+    ax.set_ylabel('F1 Score')
+    title = 'Binary Classification Performance by Model (F1)'
+    if rainfall_level:
+        title += f' (Rainfall: {rainfall_level})'
+    ax.set_title(title)
+    ax.set_xticks(x)
+    ax.set_xticklabels(model_names)
+    ax.legend()
+    
+    plt.tight_layout()
+    filename = f'binary_histogram_f1_{timestamp}'
+    if rainfall_level:
+        filename += f'_{rainfall_level}'
+    filename += '.png'
+    plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 2. Plot stacked histogram of flood categories using Jaccard Score
     flood_data = {
         'Nuisance': [results['nuisance'] for results in all_results],
         'Minor': [results['minor'] for results in all_results],
@@ -402,14 +440,44 @@ def plot_histograms(all_results, model_names, output_dir, rainfall_level=None):
         bottom += np.array(scores)
     
     ax.set_ylabel('Jaccard Score')
-    title = 'Flood Category Classification Performance by Model'
+    title = 'Flood Category Classification Performance by Model (Jaccard)'
     if rainfall_level:
         title += f' (Rainfall: {rainfall_level})'
     ax.set_title(title)
     ax.legend()
     
     plt.tight_layout()
-    filename = f'flood_categories_histogram_{timestamp}'
+    filename = f'flood_categories_histogram_jaccard_{timestamp}'
+    if rainfall_level:
+        filename += f'_{rainfall_level}'
+    filename += '.png'
+    plt.savefig(os.path.join(output_dir, filename), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 2b. Plot stacked histogram of flood categories using F1 Score
+    flood_f1_data = {
+        'Nuisance': [results['nuisance_f1'] for results in all_results],
+        'Minor': [results['minor_f1'] for results in all_results],
+        'Medium': [results['medium_f1'] for results in all_results],
+        'Major': [results['major_f1'] for results in all_results]
+    }
+    
+    fig, ax = plt.subplots(figsize=(12, 7))
+    bottom = np.zeros(len(model_names))
+    
+    for category, scores in flood_f1_data.items():
+        ax.bar(model_names, scores, bottom=bottom, label=category)
+        bottom += np.array(scores)
+    
+    ax.set_ylabel('F1 Score')
+    title = 'Flood Category Classification Performance by Model (F1)'
+    if rainfall_level:
+        title += f' (Rainfall: {rainfall_level})'
+    ax.set_title(title)
+    ax.legend()
+    
+    plt.tight_layout()
+    filename = f'flood_categories_histogram_f1_{timestamp}'
     if rainfall_level:
         filename += f'_{rainfall_level}'
     filename += '.png'
@@ -509,8 +577,10 @@ def main(args):
     # Headers for the CSV files
     region_jaccard_df = pd.DataFrame(columns=[
         'Rainfall', 'Model', 'Epochs',
-        'Jaccard_No_Flood', 'Jaccard_Flood',
-        'Jaccard_Nuisance', 'Jaccard_Minor', 'Jaccard_Medium', 'Jaccard_Major'
+        'Jaccard_No_Flood', 'Jaccard_Flood', 
+        'Jaccard_Nuisance', 'Jaccard_Minor', 'Jaccard_Medium', 'Jaccard_Major',
+        'F1_No_Flood', 'F1_Flood',
+        'F1_Nuisance', 'F1_Minor', 'F1_Medium', 'F1_Major'
     ])
     
     pixel_counts_df = pd.DataFrame(columns=[
@@ -633,7 +703,13 @@ def main(args):
                 'Jaccard_Nuisance': [jaccard_scores['BATHTUB']['nuisance']],
                 'Jaccard_Minor': [jaccard_scores['BATHTUB']['minor']],
                 'Jaccard_Medium': [jaccard_scores['BATHTUB']['medium']],
-                'Jaccard_Major': [jaccard_scores['BATHTUB']['major']]
+                'Jaccard_Major': [jaccard_scores['BATHTUB']['major']],
+                'F1_No_Flood': [jaccard_scores['BATHTUB']['no_flood_f1']],
+                'F1_Flood': [jaccard_scores['BATHTUB']['binary_f1']],
+                'F1_Nuisance': [jaccard_scores['BATHTUB']['nuisance_f1']],
+                'F1_Minor': [jaccard_scores['BATHTUB']['minor_f1']],
+                'F1_Medium': [jaccard_scores['BATHTUB']['medium_f1']],
+                'F1_Major': [jaccard_scores['BATHTUB']['major_f1']]
             })], ignore_index=True)
             
             # Then add the ML models
@@ -647,7 +723,13 @@ def main(args):
                     'Jaccard_Nuisance': [jaccard_scores[model_name]['nuisance']],
                     'Jaccard_Minor': [jaccard_scores[model_name]['minor']],
                     'Jaccard_Medium': [jaccard_scores[model_name]['medium']],
-                    'Jaccard_Major': [jaccard_scores[model_name]['major']]
+                    'Jaccard_Major': [jaccard_scores[model_name]['major']],
+                    'F1_No_Flood': [jaccard_scores[model_name]['no_flood_f1']],
+                    'F1_Flood': [jaccard_scores[model_name]['binary_f1']],
+                    'F1_Nuisance': [jaccard_scores[model_name]['nuisance_f1']],
+                    'F1_Minor': [jaccard_scores[model_name]['minor_f1']],
+                    'F1_Medium': [jaccard_scores[model_name]['medium_f1']],
+                    'F1_Major': [jaccard_scores[model_name]['major_f1']]
                 })], ignore_index=True)
             
             # Count pixels for ground truth and each model prediction
@@ -735,8 +817,8 @@ def main(args):
             # Plot predictions for each model (bathtub first)
             model_names = ['BATHTUB'] + list(models.keys())
             for i, model_name in enumerate(model_names):
-                binary_jaccard = jaccard_scores[model_name]['binary']
-                axes[i+1].set_title(f"{model_name} - Jaccard: {binary_jaccard:.3f}")
+                binary_f1 = jaccard_scores[model_name]['binary_f1']
+                axes[i+1].set_title(f"{model_name} - F1: {binary_f1:.3f}")
                 im = axes[i+1].imshow(predictions[model_name], cmap=cmap, norm=norm)
                 cbar = fig.colorbar(im, ax=axes[i+1], ticks=range(len(FloodCategory)), fraction=0.046)
                 cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
@@ -810,6 +892,35 @@ def main(args):
         plt.tight_layout()
         
         plt.savefig(os.path.join(output_dir, f'rainfall_comparison_jaccard_{timestamp}.png'), 
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Line plot of F1 scores by rainfall level
+        plt.figure(figsize=(12, 8))
+        
+        # Make sure bathtub is plotted first (will appear first in legend)
+        for model_name in ordered_models:
+            model_data = region_jaccard_df[region_jaccard_df['Model'] == model_name]
+            binary_scores = []
+            
+            for rainfall in sorted_rainfall:
+                rainfall_row = model_data[model_data['Rainfall'] == rainfall]
+                if not rainfall_row.empty:
+                    binary_scores.append(rainfall_row['F1_Flood'].values[0])
+                else:
+                    binary_scores.append(np.nan)
+            
+            plt.plot(sorted_rainfall, binary_scores, marker='o', linewidth=2, label=model_name)
+        
+        plt.xlabel('Rainfall Level')
+        plt.ylabel('F1 Score (Binary Flood)')
+        plt.title('Flood Detection F1 Performance by Rainfall Level')
+        plt.grid(True)
+        plt.legend()
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(output_dir, f'rainfall_comparison_f1_{timestamp}.png'), 
                     dpi=300, bbox_inches='tight')
         plt.close()
 
