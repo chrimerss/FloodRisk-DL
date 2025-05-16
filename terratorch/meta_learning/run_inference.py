@@ -16,13 +16,14 @@ import joblib
 import rasterio
 from rasterio.transform import Affine
 from rasterio.windows import Window
+import json
 
 # Add parent directory to path for imports
 sys.path.append('/home/users/li1995/global_flood/FloodRisk-DL/terratorch')
 
-from test import (
+from test_metric import (
     load_model, classify_depths, calc_slope, load_full_dataset, 
-    calculate_jaccard_scores, extract_rainfall_levels, 
+    calculate_jaccard_scores, 
     run_bathtub_model, RAINFALL_DICT, FLOOD_COLORS, FloodCategory
 )
 
@@ -63,6 +64,25 @@ def create_gaussian_weight_map(crop_size=512, sigma=0.5):
     # Normalize weights
     weights = weights / np.max(weights)
     return weights
+
+
+
+def extract_rainfall_levels(city_id):
+    # Define the preferred order of return periods
+    return_periods_ordered = [
+        "1000-yr", "500-yr", "200-yr", "100-yr", "50-yr",
+        "25-yr", "10-yr", "5-yr", "2-yr", "1-yr"
+    ]
+    with open("/home/users/li1995/global_flood/FloodBench/data/cities_rainfall.json", "r") as f:
+        data = json.load(f)
+    for entry in data:
+        if entry["City ID"] == city_id:
+            # Filter and order the rainfall values based on return periods
+            rainfall_levels = [
+                entry[rp].replace(" ", "") for rp in return_periods_ordered if rp in entry
+            ]
+            return rainfall_levels
+    return []
 
 def load_meta_model(meta_model_path):
     """
@@ -106,10 +126,10 @@ def load_base_models():
     # Load each model
     for model_name, model_args in model_config.items():
         try:
-            model_path = getattr(ModelPaths, model_name).value
+            model_path = getattr(ModelPaths, 'MODEL_'+model_name).value
             if os.path.exists(model_path):
                 print(f"Loading {model_name} model...")
-                models[model_name] = load_model(model_path, model_args, DEVICE)
+                models[model_name] = load_model(model_path, model_name)
             else:
                 print(f"Model path not found for {model_name}: {model_path}")
         except Exception as e:
@@ -701,22 +721,13 @@ def main(args):
     
     # Get list of domains to process
     domains = args.domains.split(',') if args.domains else ["HOU001", "HOU007", "SF001", "SF002", "NYC002", "LA002", "DAL002", "AUS002", "MIA002"]
+
     
-    # Get list of rainfall levels to process
-    if args.rainfall_levels:
-        rainfall_levels = args.rainfall_levels.split(',')
-    else:
-        # Use all available rainfall levels for the first domain
-        if domains:
-            rainfall_levels = extract_rainfall_levels(domains[0])
-        else:
-            rainfall_levels = ["100mm", "150mm", "200mm", "250mm", "300mm"]
     
-    print(f"Processing domains: {', '.join(domains)}")
-    print(f"Processing rainfall levels: {', '.join(rainfall_levels)}")
     
     # Process each domain and rainfall level
     for domain in domains:
+        rainfall_levels = extract_rainfall_levels(domain)
         for rainfall_level in rainfall_levels:
             print(f"\n{'='*80}")
             print(f"Processing domain: {domain}, rainfall: {rainfall_level}")
@@ -752,8 +763,6 @@ if __name__ == "__main__":
                         help='Directory to save inference results')
     parser.add_argument('--domains', type=str, default=None,
                         help='Comma-separated list of domains to process (e.g., HOU001,SF001)')
-    parser.add_argument('--rainfall_levels', type=str, default=None,
-                        help='Comma-separated list of rainfall levels to process (e.g., 100mm,200mm)')
     parser.add_argument('--window_size', type=int, default=512,
                         help='Size of window for processing (default: 512)')
     parser.add_argument('--overlap', type=int, default=128,

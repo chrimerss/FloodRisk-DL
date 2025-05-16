@@ -19,6 +19,7 @@ terratorch/token
 terratorch/test_results*
 *.zip
 terratorch/meta_learning_results*
+terratorch/meta_learning/meta_inference_enhanced_results/
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
