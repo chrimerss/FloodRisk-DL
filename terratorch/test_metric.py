@@ -519,6 +519,22 @@ def run_bathtub_model(dem, rainfall, dem_mean=None, dem_std=None):
     
     return water_depth, depth_categories
 
+# Create a Gaussian weight map for blending window predictions
+def create_gaussian_weight_map(crop_size=512):
+    """Create a Gaussian weight map for blending window predictions."""
+    y = np.linspace(-1, 1, crop_size)
+    x = np.linspace(-1, 1, crop_size)
+    X, Y = np.meshgrid(x, y)
+    distance = np.sqrt(X**2 + Y**2) / np.sqrt(2)
+    
+    # Create Gaussian weight with sigma=0.5 (adjust as needed)
+    sigma = 0.5
+    weights = np.exp(-(distance**2) / (2 * sigma**2))
+    
+    # Normalize weights
+    weights = weights / np.max(weights)
+    return weights
+
 def main(args):
     # Set up device for inference
     
@@ -528,12 +544,16 @@ def main(args):
     # Test parameters
     domain = args.domain
     crop_size = 512    # Size of each window (should match model input size)
+    overlap = 128      # Overlap between windows for smoother predictions
 
     RAINFALL_LEVELS= extract_rainfall_levels(domain, RAINFALL_DICT)
 
     # Create output directory if it doesn't exist
     output_dir = os.path.join(os.path.dirname(__file__), f'test_results_{domain}')
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Get the Gaussian weight map for blending
+    weight_map = create_gaussian_weight_map(crop_size)
     
     # Dictionary to store model paths and names
     model_paths = {
@@ -609,72 +629,112 @@ def main(args):
             height, width = dem.shape
             print(f"  Dataset dimensions after applying buffer: {height} x {width}")
             
-            # Create prediction arrays for each model (bathtub first)
-            print(f"  Creating prediction arrays...")
-            predictions = {'BATHTUB': np.zeros_like(flood_cat, dtype=np.int64)}
+            # Create weighted prediction arrays for each model (bathtub first)
+            print(f"  Creating weighted prediction arrays...")
+            
+            # For bathtub model: accumulate weighted flood depths before classification
+            bathtub_depth_accumulator = np.zeros((height, width), dtype=np.float32)
+            bathtub_weights_sum = np.zeros((height, width), dtype=np.float32)
+            
+            # For ML models: accumulate weighted class probabilities
+            ml_predictions = {}
+            ml_weights_sum = np.zeros((height, width), dtype=np.float32)
             for model_name in models.keys():
-                predictions[model_name] = np.zeros_like(flood_cat, dtype=np.int64)
+                ml_predictions[model_name] = np.zeros((5, height, width), dtype=np.float32)  # 5 classes
             
-            # Calculate how many windows we need to cover the entire image
-            n_windows_y = (height - crop_size + 1) // crop_size + (1 if (height - crop_size + 1) % crop_size != 0 else 0)
-            n_windows_x = (width - crop_size + 1) // crop_size + (1 if (width - crop_size + 1) % crop_size != 0 else 0)
+            # Calculate step size (stride) based on overlap
+            stride = crop_size - overlap
             
-            print(f"  Processing {n_windows_y * n_windows_x} windows ({n_windows_y} x {n_windows_x}) for inference")
+            # Calculate how many windows we need with overlapping
+            n_windows_y = max(1, (height - overlap) // stride)
+            n_windows_x = max(1, (width - overlap) // stride)
             
-            # Process each window for inference
+            print(f"  Processing {n_windows_y * n_windows_x} windows ({n_windows_y} x {n_windows_x}) with overlap={overlap}, stride={stride}")
+            
+            # Process each overlapping window for inference
             for y in range(n_windows_y):
                 for x in range(n_windows_x):
                     window_idx = y * n_windows_x + x
                     print(f"    Processing window {window_idx} ({x}, {y})")
                     
-                    # Calculate window coordinates
-                    y_start = y * crop_size
+                    # Calculate window coordinates with overlapping
+                    y_start = min(y * stride, height - crop_size)
+                    x_start = min(x * stride, width - crop_size)
                     y_end = min(y_start + crop_size, height)
-                    x_start = x * crop_size
                     x_end = min(x_start + crop_size, width)
-                    
-                    # Handle edge cases where the window is smaller than crop_size
-                    if y_end - y_start < crop_size or x_end - x_start < crop_size:
-                        # For edge cases, take a full crop_size window from the boundary
-                        y_start = max(0, height - crop_size) if y == n_windows_y - 1 else y_start
-                        x_start = max(0, width - crop_size) if x == n_windows_x - 1 else x_start
-                        y_end = y_start + crop_size
-                        x_end = x_start + crop_size
                     
                     # Extract window data
                     dem_window = dem[y_start:y_end, x_start:x_end]
                     slope_window = slope[y_start:y_end, x_start:x_end]
                     rainfall_window = rainfall[y_start:y_end, x_start:x_end]
                     
-                    # Process bathtub model FIRST
+                    # Handle window size if smaller than crop_size
+                    window_h = y_end - y_start
+                    window_w = x_end - x_start
+                    if window_h < crop_size or window_w < crop_size:
+                        pad_h = max(0, crop_size - window_h)
+                        pad_w = max(0, crop_size - window_w)
+                        dem_window = np.pad(dem_window, ((0, pad_h), (0, pad_w)), mode='reflect')
+                        slope_window = np.pad(slope_window, ((0, pad_h), (0, pad_w)), mode='reflect')
+                        rainfall_window = np.pad(rainfall_window, ((0, pad_h), (0, pad_w)), mode='reflect')
+                    
+                    # Process bathtub model FIRST with weighting
                     try:
                         # Run bathtub model for this window
                         print(f"      Running bathtub model for window {window_idx}...")
-                        water_depth, pred_cat = run_bathtub_model(dem_window, rainfall_window, dem_mean, dem_std)
+                        water_depth, _ = run_bathtub_model(dem_window, rainfall_window, dem_mean, dem_std)
                         
-                        # Store prediction in the full prediction array
-                        predictions['BATHTUB'][y_start:y_end, x_start:x_end] = pred_cat
+                        # Apply weights to flood depths and accumulate
+                        window_weights = weight_map[:window_h, :window_w]
+                        weighted_depth = water_depth[:window_h, :window_w] * window_weights
+                        bathtub_depth_accumulator[y_start:y_end, x_start:x_end] += weighted_depth
+                        bathtub_weights_sum[y_start:y_end, x_start:x_end] += window_weights
                         
                     except Exception as e:
                         print(f"      Error processing bathtub model for window {window_idx}: {e}")
                     
-                    # Process each ML model second
+                    # Process each ML model second with weighting
                     for model_name, model in models.items():
                         try:
                             # Prepare input tensor
                             model_input = np.stack([dem_window, slope_window, rainfall_window])
                             input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(device)
                             
-                            # Get prediction
+                            # Get prediction (class probabilities)
                             with torch.no_grad():
                                 pred = model(input_tensor).output.squeeze().detach().cpu().numpy()
-                                pred_cat = pred.argmax(axis=0)
                             
-                            # Store prediction in the full prediction array
-                            predictions[model_name][y_start:y_end, x_start:x_end] = pred_cat
+                            # Apply weights to predictions and accumulate
+                            window_weights = weight_map[:window_h, :window_w]
+                            for c in range(pred.shape[0]):  # For each class channel
+                                weighted_pred = pred[c, :window_h, :window_w] * window_weights
+                                ml_predictions[model_name][c, y_start:y_end, x_start:x_end] += weighted_pred
+                            
+                            # Accumulate weights (same for all models)
+                            if model_name == list(models.keys())[0]:  # Only do this once
+                                ml_weights_sum[y_start:y_end, x_start:x_end] += window_weights
                         
                         except Exception as e:
                             print(f"      Error processing model {model_name} for window {window_idx}: {e}")
+            
+            # Finalize predictions with normalization and classification
+            print(f"  Finalizing weighted predictions...")
+            predictions = {}
+            
+            # For bathtub model: normalize depths and then classify
+            normalized_depths = np.divide(bathtub_depth_accumulator, bathtub_weights_sum, 
+                                        out=np.zeros_like(bathtub_depth_accumulator), 
+                                        where=bathtub_weights_sum > 0)
+            predictions['BATHTUB'] = classify_depths(normalized_depths)
+            
+            # For ML models: normalize probabilities and get argmax
+            for model_name in models.keys():
+                normalized_probs = np.zeros_like(ml_predictions[model_name])
+                for c in range(5):
+                    normalized_probs[c] = np.divide(ml_predictions[model_name][c], ml_weights_sum,
+                                                  out=np.zeros_like(ml_predictions[model_name][c]),
+                                                  where=ml_weights_sum > 0)
+                predictions[model_name] = np.argmax(normalized_probs, axis=0).astype(np.int64)
             
             time_end= time.time()
             proc_time= (time_end - time_start)
@@ -810,7 +870,7 @@ def main(args):
             
             # Plot ground truth
             axes[0].set_title("Ground Truth")
-            im_gt = axes[0].imshow(flood_cat, cmap=cmap, norm=norm)
+            im_gt = axes[0].imshow(flood_cat[:-overlap,:-overlap], cmap=cmap, norm=norm)
             cbar = fig.colorbar(im_gt, ax=axes[0], ticks=range(len(FloodCategory)), fraction=0.046)
             cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
             
@@ -819,7 +879,7 @@ def main(args):
             for i, model_name in enumerate(model_names):
                 binary_f1 = jaccard_scores[model_name]['binary_f1']
                 axes[i+1].set_title(f"{model_name} - F1: {binary_f1:.3f}")
-                im = axes[i+1].imshow(predictions[model_name], cmap=cmap, norm=norm)
+                im = axes[i+1].imshow(predictions[model_name][:-overlap,:-overlap], cmap=cmap, norm=norm)
                 cbar = fig.colorbar(im, ax=axes[i+1], ticks=range(len(FloodCategory)), fraction=0.046)
                 cbar.ax.set_yticklabels([cat.name for cat in FloodCategory])
             
@@ -832,8 +892,8 @@ def main(args):
             plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave space for the suptitle
             
             # Save the figure
-            region_viz_path = os.path.join(output_dir, f'domain_prediction_{rainfall_level}_{timestamp}.png')
-            plt.savefig(region_viz_path, dpi=200, bbox_inches='tight')
+            region_viz_path = os.path.join(output_dir, f'domain_prediction_{rainfall_level}_{timestamp}.svg')
+            plt.savefig(region_viz_path, dpi=300, bbox_inches='tight', format='svg')
             plt.close()
             
             # Plot histograms comparing model performances
