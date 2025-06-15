@@ -4,7 +4,7 @@ import numpy as np
 import requests
 import sys
 import os
-from osgeo import gdal
+# from osgeo import gdal
 import urllib
 import pyproj #Used for transforming / reprojecting points
 ### GLOBAL VARIABLES ###

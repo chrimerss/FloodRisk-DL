@@ -21,6 +21,7 @@ terratorch/test_results*
 terratorch/meta_learning_results*
 terratorch/meta_learning/meta_inference_enhanced_results/
 terratorch/medellin
+data/download_US_DEM/national_map_downloader
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python

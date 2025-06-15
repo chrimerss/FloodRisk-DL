@@ -66,21 +66,37 @@ def create_gaussian_weight_map(crop_size=512, sigma=0.5):
     weights = weights / np.max(weights)
     return weights
 
-def load_meta_model(meta_model_path):
+def load_meta_model(meta_model_path, n_jobs=-1):
     """
-    Load the trained meta-model.
+    Load the trained meta-model and enable parallel prediction.
     
     Args:
         meta_model_path: Path to the saved meta-model
+        n_jobs: Number of parallel jobs for prediction (-1 for all cores)
         
     Returns:
-        Loaded meta-model
+        Loaded meta-model with parallel prediction enabled
     """
     print(f"Loading meta-model from: {meta_model_path}")
     try:
         meta_model = joblib.load(meta_model_path)
         print("Meta-model loaded successfully.")
         print(f"Model type: {type(meta_model).__name__}")
+        
+        # Enable parallel prediction for scikit-learn models
+        if hasattr(meta_model, 'n_jobs'):
+            original_n_jobs = getattr(meta_model, 'n_jobs', None)
+            print(f"Original n_jobs: {original_n_jobs}")
+            
+            # Set n_jobs for parallel prediction
+            meta_model.n_jobs = n_jobs
+            print(f"Enabled parallel prediction with n_jobs={n_jobs}")
+        
+        # For ensemble models like RandomForest, also check if we can set parallel prediction
+        # for individual estimators
+        if hasattr(meta_model, 'estimators_') and hasattr(meta_model, 'n_jobs'):
+            print(f"Ensemble model with {len(meta_model.estimators_)} estimators - parallel prediction enabled")
+        
         return meta_model
     except Exception as e:
         print(f"Error loading meta-model: {str(e)}")
@@ -765,9 +781,10 @@ def main(args):
     print(f"Output file: {args.output_file}")
     print(f"Window size: {args.window_size}, Overlap: {args.overlap}, Sigma: {args.sigma}")
     print(f"Batch size: {args.batch_size:,} pixels")
+    print(f"Parallel jobs for meta-model: {args.n_jobs}")
     
-    # Load meta-model
-    meta_model = load_meta_model(args.meta_model)
+    # Load meta-model with parallel prediction
+    meta_model = load_meta_model(args.meta_model, n_jobs=args.n_jobs)
     if meta_model is None:
         print("Failed to load meta-model. Exiting.")
         return
@@ -817,6 +834,9 @@ if __name__ == "__main__":
                         help='Standard deviation for Gaussian kernel (default: 0.5)')
     parser.add_argument('--batch_size', type=int, default=5000000,
                         help='Maximum number of pixels to process in each batch (default: 1,000,000)')
+    parser.add_argument('--n_jobs', type=int, default=-1,
+                        help='Number of parallel jobs for meta-model prediction (-1 for all cores, default: -1)')
+
     
     args = parser.parse_args()
     main(args) 
