@@ -19,7 +19,7 @@
 
 #*** PBS setting when needed
 #SBATCH --job-name=US_CITIES_DEM
-#SBATCH --time=24:00:00
+#SBATCH --time=6:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -42,14 +42,15 @@ source /home/users/li1995/global_flood/FloodRisk-DL/.venv/bin/activate
 DEM_BASE_DIR="/home/users/li1995/global_flood/FloodRisk-DL/data/download_US_DEM"
 
 # Loop through each city folder
-for city_folder in $(ls -d "$DEM_BASE_DIR"/dem_data_* | sort -r); do
-#for city_folder in $(ls -d "$DEM_BASE_DIR"/dem_data_*); do
+#for city_folder in $(ls -d "$DEM_BASE_DIR"/dem_data_Harris_TX_geoid* | sort -r); do
+for city_folder in $(ls -d "$DEM_BASE_DIR"/dem_data_Harris_TX_geoid*); do
     if [ -d "$city_folder" ]; then
         city_name=$(basename "$city_folder")
         echo "Processing city: $city_name"
         
         # Loop through each .tif file in the city folder
         for dem_file in "$city_folder"/USGS*.tif; do
+        #for dem_file in $(ls -d "$city_folder"/USGS*.tif | sort -r); do
             if [ -f "$dem_file" ]; then
                 dem_filename=$(basename "$dem_file")
                 echo "Processing DEM: $dem_filename"
