@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 # coding: utf-8
-
 import os
 import sys
 import torch
@@ -20,6 +19,14 @@ import json
 import warnings
 import xarray as xr
 import rioxarray as rxr
+import zarr
+from numba import njit, prange
+import multiprocessing as mp
+from functools import partial
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import tempfile
+import shutil
+import threading
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -141,7 +148,7 @@ def load_base_models():
 def load_dem_from_zarr(zarr_file, rainfall_mm):
     """
     Load DEM data from a Zarr file and prepare data for model inference.
-    Note: Slope calculation is deferred to window-level processing to save memory.
+    Note: Uses lazy loading to avoid loading entire DEM into memory.
     
     Args:
         zarr_file: Path to the DEM Zarr file
@@ -166,21 +173,13 @@ def load_dem_from_zarr(zarr_file, rainfall_mm):
             # Fallback: assume it's a single DataArray
             da = ds
         
-        # Extract DEM data as numpy array
         print(f"DataArray type: {type(da)}")
         print(f"DataArray shape: {da.shape}")
         print(f"DataArray dims: {da.dims}")
         
-        # Convert to numpy array and ensure it's float32
-        if hasattr(da.values, 'compute'):
-            # Handle dask arrays
-            print("Computing dask array...")
-            dem_data = da.values.compute().astype(np.float32)
-        else:
-            # Handle regular numpy arrays
-            dem_data = da.values.astype(np.float32)
-        
-        print(f"DEM dimensions: {dem_data.shape[0]} rows × {dem_data.shape[1]} columns")
+        # Keep as dask array - do NOT compute the entire array
+        print(f"DEM dimensions: {da.shape[0]} rows × {da.shape[1]} columns")
+        height, width = da.shape
         
         # Extract spatial reference information from attributes
         crs_str = da.attrs.get('crs', 'EPSG:4326')
@@ -203,56 +202,44 @@ def load_dem_from_zarr(zarr_file, rainfall_mm):
         
         print(f"Transform: {transform}")
         
-        # Create metadata for output GeoTIFF
-        geotiff_meta = {
+        # Create metadata for output files
+        output_meta = {
             'driver': 'GTiff',
             'crs': crs_str,
             'transform': transform,
-            'width': dem_data.shape[1],
-            'height': dem_data.shape[0],
+            'width': width,
+            'height': height,
             'count': 1,
             'dtype': 'uint8',
             'nodata': 255  # Use 255 for output (uint8 compatible)
         }
         
-        # Create a mask for valid data
+        # Calculate statistics from a sample of the data to avoid loading everything
+        print("Calculating DEM statistics from sample data...")
+        # Sample every 100th pixel in both dimensions to get statistics
+        sample_step = 100
+        sample_data = da[::sample_step, ::sample_step].values
+        
+        # Create a mask for valid data in the sample
         if nodata_value is not None and not np.isnan(nodata_value):
-            # Handle both NaN and specific nodata values
-            mask = np.logical_and(dem_data != nodata_value, ~np.isnan(dem_data))
+            sample_mask = np.logical_and(sample_data != nodata_value, ~np.isnan(sample_data))
         else:
-            # Only check for NaN values
-            mask = ~np.isnan(dem_data)
+            sample_mask = ~np.isnan(sample_data)
         
-        # Make a copy of the mask for later use
-        original_mask = mask.copy()
-        
-        # Calculate statistics from valid data
-        dem_valid = dem_data[mask]
-        if len(dem_valid) > 0:
-            dem_mean = np.mean(dem_valid)
-            dem_std = np.std(dem_valid)
-            print(f"DEM statistics - Mean: {dem_mean:.2f}, Std: {dem_std:.2f}")
+        # Calculate statistics from valid sample data
+        sample_valid = sample_data[sample_mask]
+        if len(sample_valid) > 0:
+            dem_mean = np.mean(sample_valid)
+            dem_std = np.std(sample_valid)
+            print(f"DEM statistics (from sample) - Mean: {dem_mean:.2f}, Std: {dem_std:.2f}")
         else:
-            print("Warning: No valid data found in DEM!")
+            print("Warning: No valid data found in sample!")
             dem_mean = 0
             dem_std = 1
         
-        print(f"Valid data: {np.sum(mask)}/{dem_data.size} pixels ({np.sum(mask)/dem_data.size*100:.2f}%)")
-        
-        # Replace invalid values with a sentinel value for processing
-        dem_data[~mask] = -9999
-        
-        # NOTE: Slope calculation is now deferred to window-level processing to save memory
-        print("Slope calculation deferred to window-level processing to save memory")
-        
-        # Create uniform rainfall input
-        print(f"Creating rainfall input with {rainfall_mm}mm...")
-        rainfall_m = rainfall_mm / 1000.0  # Convert to meters
-        
-        # Normalize the DEM (using only valid values for statistics)
-        dem_norm = dem_data.copy()
-        dem_norm[mask] = (dem_data[mask] - dem_mean) / dem_std
-        dem_norm[~mask] = 0  # Set to 0 for processing
+        # Calculate approximate valid data percentage
+        valid_ratio = np.sum(sample_mask) / sample_mask.size
+        print(f"Estimated valid data: {valid_ratio*100:.2f}% (from sample)")
         
         # Extract county information from attributes if available
         county_name = da.attrs.get('county', 'Unknown')
@@ -262,14 +249,15 @@ def load_dem_from_zarr(zarr_file, rainfall_mm):
         print(f"County: {county_name}, State: {state_name}, GEOID: {geoid}")
         
         return {
-            'dem': dem_norm,
-            'dem_raw': dem_data,  # Keep raw DEM for slope calculation
+            'zarr_file': zarr_file,  # Add the original zarr file path
+            'dem_dask': da,  # Keep as dask array for lazy loading
             'rainfall_mm': rainfall_mm,
-            'mask': mask,
-            'original_mask': original_mask,
             'dem_mean': dem_mean,
             'dem_std': dem_std,
-            'geotiff_meta': geotiff_meta,
+            'nodata_value': nodata_value,
+            'height': height,
+            'width': width,
+            'geotiff_meta': output_meta,
             'output_nodata': 255,  # Use 255 for output consistency
             'county_info': {
                 'county': county_name,
@@ -284,39 +272,39 @@ def load_dem_from_zarr(zarr_file, rainfall_mm):
         traceback.print_exc()
         return None
 
-def get_model_predictions(data, models, window_size=512, overlap=128, sigma=0.5):
+def get_model_predictions(data, models, output_file, window_size=512, overlap=128, sigma=0.5, n_workers=None):
     """
     Get predictions from all base models for the given DEM data,
-    using Gaussian kernel smoothing at window boundaries.
-    Calculates slope and rainfall at the window level to save memory.
+    using Gaussian kernel smoothing at window boundaries with parallel processing.
+    Processes models sequentially to save memory and uses zarr for intermediate storage.
     
     Args:
         data: Dictionary with DEM data and metadata
         models: Dictionary of loaded models
+        output_file: Base output file path for saving intermediate results
         window_size: Size of the window for processing (default: 512)
         overlap: Overlap between adjacent windows in pixels (default: 128)
         sigma: Standard deviation for the Gaussian kernel (default: 0.5)
+        n_workers: Number of parallel workers (default: min(16, cpu_count()))
         
     Returns:
         Dictionary with predictions
     """
     try:
         # Extract input data
-        dem = data['dem']
-        dem_raw = data['dem_raw']
-        mask = data['mask']
+        dem_dask = data['dem_dask']
+        height = data['height']
+        width = data['width']
         rainfall_mm = data['rainfall_mm']
+        dem_mean = data['dem_mean']
+        dem_std = data['dem_std']
+        nodata_value = data['nodata_value']
         output_nodata = data['output_nodata']
         
-        height, width = dem.shape
         print(f"Data dimensions: {height} x {width}")
         
         # Convert rainfall to meters
         rainfall_m = rainfall_mm / 1000.0
-        
-        # Initialize dictionary of predictions
-        predictions = {}
-        probs = {}  # For storing class probabilities
         
         # Get Gaussian weight map for window blending
         weight_map = create_gaussian_weight_map(window_size, sigma)
@@ -329,132 +317,241 @@ def get_model_predictions(data, models, window_size=512, overlap=128, sigma=0.5)
         n_windows_x = max(1, int(np.ceil((width - overlap) / stride))) if width > window_size else 1
         
         print(f"Using {n_windows_y}x{n_windows_x} windows with size {window_size}, stride={stride}, overlap={overlap}")
-        print("Calculating slope and rainfall at window level to save memory")
         
-        # Process each ML model
-        for model_name, model in models.items():
+        # Set up parallel processing
+        if n_workers is None:
+            n_workers = min(8, os.cpu_count())  # Use fewer threads to avoid GPU conflicts
+            
+        # Critical memory optimization for very large datasets
+        total_pixels = height * width
+        if total_pixels > 50_000_000:  # > 50M pixels (like Harris County with 7.6B pixels)
+            if n_workers is None or n_workers > 2:
+                n_workers = min(2, os.cpu_count())
+                print(f"Large dataset detected ({total_pixels:,} pixels). Reducing to {n_workers} workers for memory conservation.")
+        
+        print(f"Using {n_workers} parallel threads")
+        print("Processing models sequentially to save memory...")
+        
+        # Create temporary directory for intermediate zarr files
+        temp_dir = tempfile.mkdtemp(prefix='flood_inference_')
+        print(f"Using temporary directory: {temp_dir}")
+        
+        # Prepare window coordinates for all windows
+        all_window_coords = []
+        for y_idx in range(n_windows_y):
+            for x_idx in range(n_windows_x):
+                y_start = min(y_idx * stride, height - window_size) if height > window_size else 0
+                x_start = min(x_idx * stride, width - window_size) if width > window_size else 0
+                y_end = min(y_start + window_size, height)
+                x_end = min(x_start + window_size, width)
+                all_window_coords.append((y_idx, x_idx, y_start, x_start, y_end, x_end))
+        
+        total_windows = len(all_window_coords)
+        print(f"Total windows to process: {total_windows}")
+        
+        # Create GPU lock for thread synchronization
+        gpu_lock = threading.Lock()
+        
+        # Initialize dictionaries for final results
+        predictions = {}
+        probs = {}
+        
+        # Process each ML model sequentially
+        for model_idx, (model_name, model) in enumerate(models.items()):
             try:
-                print(f"  Running {model_name} model with Gaussian smoothing...")
-                # Initialize output arrays for accumulating weighted predictions
-                probs_out = np.zeros((5, height, width), dtype=np.float32)
-                weights_sum = np.zeros((height, width), dtype=np.float32)
+                print(f"  Running {model_name} model ({model_idx+1}/{len(models)}) with Gaussian smoothing...")
                 
-                # Process image in windows with overlap
-                for y_idx in range(n_windows_y):
-                    for x_idx in range(n_windows_x):
-                        # Calculate window coordinates
-                        y_start = min(y_idx * stride, height - window_size) if height > window_size else 0
-                        x_start = min(x_idx * stride, width - window_size) if width > window_size else 0
-                        y_end = min(y_start + window_size, height)
-                        x_end = min(x_start + window_size, width)
-                        
-                        # Calculate padded window coordinates for slope calculation
-                        # Add padding around the window to properly calculate slope
-                        pad_size = 2  # Need at least 1 pixel padding for slope calculation
-                        y_start_padded = max(0, y_start - pad_size)
-                        x_start_padded = max(0, x_start - pad_size)
-                        y_end_padded = min(height, y_end + pad_size)
-                        x_end_padded = min(width, x_end + pad_size)
-                        
-                        # Extract padded window data for slope calculation
-                        dem_raw_padded = dem_raw[y_start_padded:y_end_padded, x_start_padded:x_end_padded]
-                        mask_padded = mask[y_start_padded:y_end_padded, x_start_padded:x_end_padded]
-                        
-                        # Calculate slope for the padded window
-                        with warnings.catch_warnings():
-                            warnings.filterwarnings('ignore', category=RuntimeWarning)
-                            slope_padded = calc_slope(dem_raw_padded)
-                            # Set slope to 0 for invalid DEM cells
-                            slope_padded[~mask_padded] = 0
-                        
-                        # Extract the actual window area from the padded slope
-                        pad_y_offset = y_start - y_start_padded
-                        pad_x_offset = x_start - x_start_padded
-                        actual_window_h = y_end - y_start
-                        actual_window_w = x_end - x_start
-                        
-                        slope_window = slope_padded[
-                            pad_y_offset:pad_y_offset + actual_window_h,
-                            pad_x_offset:pad_x_offset + actual_window_w
-                        ]
-                        
-                        # Extract window data (normalized DEM)
-                        dem_window = dem[y_start:y_end, x_start:x_end]
-                        
-                        # Create rainfall window
-                        rainfall_window = np.ones_like(dem_window) * rainfall_m
-                        # Set rainfall to 0 for invalid DEM cells
-                        window_mask = mask[y_start:y_end, x_start:x_end]
-                        rainfall_window[~window_mask] = 0
-                        
-                        # Handle window size if smaller than crop_size
-                        window_h, window_w = dem_window.shape
-                        if window_h < window_size or window_w < window_size:
-                            pad_h = max(0, window_size - window_h)
-                            pad_w = max(0, window_size - window_w)
-                            dem_window = np.pad(dem_window, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
-                            slope_window = np.pad(slope_window, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
-                            rainfall_window = np.pad(rainfall_window, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
-                        
-                        # Prepare input tensor
-                        model_input = np.stack([dem_window, slope_window, rainfall_window])
-                        input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(DEVICE)
-                        
-                        # Get prediction
-                        with torch.no_grad():
-                            output = model(input_tensor)
-                            pred = output.output.squeeze().detach().cpu().numpy()
-                        
-                        # Extract actual window dimensions
-                        window_h = y_end - y_start
-                        window_w = x_end - x_start
-                        current_weight = weight_map[:window_h, :window_w]
-                        
-                        # Apply weights to prediction probabilities and add to accumulated predictions
-                        for c in range(pred.shape[0]):
-                            weighted_pred = pred[c, :window_h, :window_w] * current_weight
-                            probs_out[c, y_start:y_end, x_start:x_end] += weighted_pred
-                        
-                        # Add weights to sum for later normalization
-                        weights_sum[y_start:y_end, x_start:x_end] += current_weight
-                        
-                        # Clear CUDA cache to free memory
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                # Create zarr arrays for this model's outputs
+                probs_zarr_path = os.path.join(temp_dir, f'probs_{model_name}.zarr')
+                weights_zarr_path = os.path.join(temp_dir, f'weights_{model_name}.zarr')
                 
-                # Normalize the predictions by the weight sum
-                for c in range(probs_out.shape[0]):
-                    probs_out[c] = np.divide(probs_out[c], weights_sum, 
-                                            out=np.zeros_like(probs_out[c]), 
-                                            where=weights_sum > 0)
+                # Initialize zarr arrays for accumulating weighted predictions
+                probs_zarr = zarr.open(probs_zarr_path, mode='w', 
+                                     shape=(5, height, width), 
+                                     chunks=(1, min(2048, height), min(2048, width)),
+                                     dtype=np.float32, fill_value=0.0)
                 
-                # Get class with highest probability for each pixel
-                pred_cat = np.argmax(probs_out, axis=0).astype(np.int64)
+                weights_zarr = zarr.open(weights_zarr_path, mode='w',
+                                       shape=(height, width),
+                                       chunks=(min(2048, height), min(2048, width)),
+                                       dtype=np.float32, fill_value=0.0)
                 
-                # Apply mask - set invalid pixels to output nodata value
-                pred_cat[~mask] = output_nodata
+                # Process windows in parallel batches using threading
+                batch_size = max(1, total_windows // (n_workers * 2))  # Smaller batches for threading
                 
-                # Store results
+                # Use much smaller batches for very large datasets to prevent OOM
+                if total_pixels > 50_000_000:  # Large datasets like Harris County
+                    batch_size = max(1, total_windows // (n_workers * 8))  # Much smaller batches
+                    print(f"    Large dataset: using smaller batch size of {batch_size} windows per batch")
+                
+                window_batches = [all_window_coords[i:i + batch_size] 
+                                for i in range(0, len(all_window_coords), batch_size)]
+                
+                print(f"    Processing {len(window_batches)} batches of ~{batch_size} windows each using threads")
+                
+                # Process batches in parallel using threads
+                with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                    # Submit all batches
+                    future_to_batch = {}
+                    for batch_idx, batch in enumerate(window_batches):
+                        future = executor.submit(
+                            process_window_batch_threaded,
+                            batch,
+                            model,  # Share the model instance
+                            dem_dask,  # Share the DEM data
+                            rainfall_m,
+                            dem_mean,
+                            dem_std,
+                            nodata_value,
+                            window_size,
+                            weight_map,
+                            gpu_lock
+                        )
+                        future_to_batch[future] = batch_idx
+                    
+                    # Collect results as they complete
+                    completed_batches = 0
+                    for future in as_completed(future_to_batch):
+                        batch_idx = future_to_batch[future]
+                        try:
+                            batch_results = future.result(timeout=300)  # 5 minute timeout
+                            completed_batches += 1
+                            
+                            if completed_batches % max(1, len(window_batches) // 10) == 0:
+                                print(f"    Completed {completed_batches}/{len(window_batches)} batches "
+                                      f"({completed_batches/len(window_batches)*100:.1f}%)")
+                            
+                            # Accumulate results into zarr arrays
+                            for window_coords, weighted_probs, current_weight in batch_results:
+                                _, _, y_start, x_start, y_end, x_end = window_coords
+                                
+                                # Optimized zarr updates - batch the operations
+                                window_slice_y = slice(y_start, y_end)
+                                window_slice_x = slice(x_start, x_end)
+                                
+                                # Read current values once for all classes
+                                current_probs = probs_zarr[:, window_slice_y, window_slice_x]
+                                current_weights = weights_zarr[window_slice_y, window_slice_x]
+                                
+                                # Add weighted probabilities
+                                current_probs += weighted_probs
+                                
+                                # Update zarr arrays in batch
+                                probs_zarr[:, window_slice_y, window_slice_x] = current_probs
+                                weights_zarr[window_slice_y, window_slice_x] = current_weights + current_weight
+                                
+                                # Periodic memory cleanup for large datasets
+                                if total_pixels > 50_000_000 and completed_batches % 5 == 0:
+                                    import gc
+                                    gc.collect()
+                                    if torch.cuda.is_available():
+                                        torch.cuda.empty_cache()
+                                
+                        except Exception as e:
+                            print(f"    Error processing batch {batch_idx}: {e}")
+                            # Don't print full traceback for timeout errors
+                            if "timeout" not in str(e).lower():
+                                import traceback
+                                traceback.print_exc()
+                
+                print(f"    Completed all {total_windows} windows for {model_name}")
+                
+                # Clear GPU cache after each model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                print(f"    Normalizing predictions for {model_name}...")
+                
+                # Normalize by weights to get final probabilities, process in chunks to save memory
+                normalize_chunk_size = 2048
+                n_norm_chunks_y = int(np.ceil(height / normalize_chunk_size))
+                n_norm_chunks_x = int(np.ceil(width / normalize_chunk_size))
+                
+                for norm_y in range(n_norm_chunks_y):
+                    for norm_x in range(n_norm_chunks_x):
+                        y_norm_start = norm_y * normalize_chunk_size
+                        y_norm_end = min((norm_y + 1) * normalize_chunk_size, height)
+                        x_norm_start = norm_x * normalize_chunk_size
+                        x_norm_end = min((norm_x + 1) * normalize_chunk_size, width)
+                        
+                        # Read chunk data
+                        chunk_slice_y = slice(y_norm_start, y_norm_end)
+                        chunk_slice_x = slice(x_norm_start, x_norm_end)
+                        
+                        probs_chunk = probs_zarr[:, chunk_slice_y, chunk_slice_x]
+                        weights_chunk = weights_zarr[chunk_slice_y, chunk_slice_x]
+                        
+                        # Normalize (avoid division by zero)
+                        weights_chunk[weights_chunk == 0] = 1e-8
+                        probs_chunk = probs_chunk / weights_chunk[np.newaxis, :, :]
+                        
+                        # Write back normalized probabilities
+                        probs_zarr[:, chunk_slice_y, chunk_slice_x] = probs_chunk
+                
+                # Create output arrays for this model - only keep predictions, save probabilities to disk
+                pred_cat = np.zeros((height, width), dtype=np.uint8)
+                
+                # Get class with highest probability for each pixel - process in chunks
+                print(f"    Computing final predictions for {model_name}...")
+                
+                classify_chunk_size = 4096  # Larger chunks for classification
+                n_classify_chunks_y = int(np.ceil(height / classify_chunk_size))
+                n_classify_chunks_x = int(np.ceil(width / classify_chunk_size))
+                
+                for class_y in range(n_classify_chunks_y):
+                    for class_x in range(n_classify_chunks_x):
+                        y_class_start = class_y * classify_chunk_size
+                        y_class_end = min((class_y + 1) * classify_chunk_size, height)
+                        x_class_start = class_x * classify_chunk_size
+                        x_class_end = min((class_x + 1) * classify_chunk_size, width)
+                        
+                        # Read probability chunk and compute argmax
+                        probs_chunk = probs_zarr[:, y_class_start:y_class_end, x_class_start:x_class_end]
+                        pred_chunk = np.argmax(probs_chunk, axis=0).astype(np.uint8)
+                        
+                        # Store predictions
+                        pred_cat[y_class_start:y_class_end, x_class_start:x_class_end] = pred_chunk
+                
+                # Store final results - only predictions, probabilities saved to temp zarr
                 predictions[model_name] = pred_cat
-                probs[model_name] = probs_out
+                probs[model_name] = probs_zarr_path  # Store path instead of array
+                
+                # Clean up intermediate zarr files for this model
+                shutil.rmtree(probs_zarr_path, ignore_errors=True)
+                shutil.rmtree(weights_zarr_path, ignore_errors=True)
+                
+                # Clear GPU memory
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 
                 print(f"  Completed {model_name} model inference")
+                
+                # Optionally unload model to free memory (if processing very large data)
+                # Note: This would require reloading models, which we skip for now
+                # but could be added if memory is still an issue
                 
             except Exception as e:
                 print(f"  Error running model {model_name}: {e}")
                 import traceback
                 traceback.print_exc()
-                # Initialize with zeros if model fails
-                predictions[model_name] = np.zeros_like(dem, dtype=np.int64)
-                probs[model_name] = np.zeros((5, height, width), dtype=np.float32)
+                # Initialize with nodata if model fails
+                predictions[model_name] = np.ones((height, width), dtype=np.uint8) * output_nodata
+                probs[model_name] = None
+        
+        # Clean up temporary directory
+        shutil.rmtree(temp_dir, ignore_errors=True)
         
         return {
-            'dem': dem,
             'rainfall_mm': rainfall_mm,
             'predictions': predictions,
             'probabilities': probs,
-            'mask': mask,
-            'output_nodata': output_nodata
+            'height': height,
+            'width': width,
+            'output_nodata': output_nodata,
+            'dem_dask': dem_dask,
+            'dem_mean': dem_mean,
+            'dem_std': dem_std,
+            'nodata_value': nodata_value
         }
     
     except Exception as e:
@@ -466,7 +563,7 @@ def get_model_predictions(data, models, window_size=512, overlap=128, sigma=0.5)
 def extract_features_batched(pred_result, batch_size=1000000):
     """
     Extract features for meta-model inference from base model predictions in batches.
-    Calculates slope in chunks to avoid memory issues with large DEMs.
+    Works with lazy-loaded dask arrays and zarr-stored probabilities to avoid memory issues.
     
     Args:
         pred_result: Dictionary with prediction results
@@ -476,12 +573,15 @@ def extract_features_batched(pred_result, batch_size=1000000):
         Generator that yields (batch features, batch indices, height, width) for each batch
     """
     # Extract base data and probabilities
-    dem = pred_result['dem']
+    dem_dask = pred_result['dem_dask']
     rainfall_mm = pred_result['rainfall_mm']
-    probs = pred_result['probabilities']
-    mask = pred_result['mask']
+    probs_paths = pred_result['probabilities']  # Now contains file paths
+    height = pred_result['height']
+    width = pred_result['width']
+    dem_mean = pred_result['dem_mean']
+    dem_std = pred_result['dem_std']
+    nodata_value = pred_result['nodata_value']
     
-    height, width = dem.shape
     print(f"Preparing to extract features from image of size {height}x{width}")
     
     # Convert rainfall to meters for consistency
@@ -490,100 +590,130 @@ def extract_features_batched(pred_result, batch_size=1000000):
     # Features: DEM, slope (will be calculated), rainfall, model probabilities
     num_base_features = 3  # DEM, slope, rainfall
     
-    # Get available DL models
-    dl_models = list(probs.keys())
+    # Get available DL models - filter out failed models
+    dl_models = [name for name, path in probs_paths.items() if path is not None]
     num_model_features = len(dl_models) * 5  # 5 class probabilities per model
     num_features = num_base_features + num_model_features
     
-    # Flatten mask to get indices of valid pixels
-    flat_mask = mask.flatten()
-    valid_indices = np.where(flat_mask)[0]
-    valid_pixels = len(valid_indices)
+    print(f"Using {len(dl_models)} models for meta-learning: {dl_models}")
     
-    print(f"Total valid pixels to process: {valid_pixels:,}")
-    
-    # Calculate number of batches
-    num_batches = int(np.ceil(valid_pixels / batch_size))
-    print(f"Processing in {num_batches} batches of up to {batch_size:,} pixels each")
-    print("Calculating slope in chunks to avoid memory issues...")
-    
-    # Calculate chunk size for slope computation (process in 2048x2048 chunks)
-    chunk_size = 2048
+    # Calculate mask for valid pixels by processing in larger chunks for efficiency
+    print("Identifying valid pixels in chunks...")
+    chunk_size = 4096  # Increased chunk size for better efficiency
     n_chunks_y = int(np.ceil(height / chunk_size))
     n_chunks_x = int(np.ceil(width / chunk_size))
     
-    # Initialize slope array (only allocate memory for valid pixels would be ideal, but for simplicity, use full array)
-    # For very large arrays, we'll calculate slope on-demand for each chunk
-    print(f"Will calculate slope in {n_chunks_y}x{n_chunks_x} chunks of up to {chunk_size}x{chunk_size} pixels")
+    valid_indices_list = []
+    total_valid_pixels = 0
     
-    # Pre-calculate slope for smaller images, or use chunk-based approach for larger ones
-    total_pixels = height * width
-    if total_pixels <= 50000000:  # ~7000x7000 pixels or smaller
-        print("Image small enough - calculating slope for entire array...")
-        with warnings.catch_warnings():
-            warnings.filterwarnings('ignore', category=RuntimeWarning)
-            slope = calc_slope(dem)
-            slope[~mask] = 0
-        use_precalculated_slope = True
-    else:
-        print("Large image - will calculate slope on demand for each chunk...")
-        slope = None
-        use_precalculated_slope = False
+    for chunk_y in range(n_chunks_y):
+        for chunk_x in range(n_chunks_x):
+            y_start = chunk_y * chunk_size
+            y_end = min((chunk_y + 1) * chunk_size, height)
+            x_start = chunk_x * chunk_size
+            x_end = min((chunk_x + 1) * chunk_size, width)
+            
+            # Load DEM chunk and create mask
+            dem_chunk = dem_dask[y_start:y_end, x_start:x_end].values.astype(np.float32)
+            
+            # Create mask for this chunk
+            if nodata_value is not None and not np.isnan(nodata_value):
+                mask_chunk = np.logical_and(dem_chunk != nodata_value, ~np.isnan(dem_chunk))
+            else:
+                mask_chunk = ~np.isnan(dem_chunk)
+            
+            # Find valid pixels in this chunk
+            y_chunk_indices, x_chunk_indices = np.where(mask_chunk)
+            
+            if len(y_chunk_indices) > 0:
+                # Convert to global coordinates
+                global_y_indices = y_chunk_indices + y_start
+                global_x_indices = x_chunk_indices + x_start
+                
+                # Store indices as a list of tuples
+                chunk_indices = list(zip(global_y_indices, global_x_indices))
+                valid_indices_list.extend(chunk_indices)
+                total_valid_pixels += len(chunk_indices)
     
-    # Create rainfall array
-    rainfall = np.ones_like(dem) * rainfall_m
-    rainfall[~mask] = 0
+    print(f"Found {total_valid_pixels:,} valid pixels")
     
-    # Process in batches
+    # Convert to arrays for easier processing
+    if total_valid_pixels == 0:
+        print("No valid pixels found!")
+        return
+    
+    valid_indices = np.array(valid_indices_list)
+    y_indices = valid_indices[:, 0].astype(np.int32)
+    x_indices = valid_indices[:, 1].astype(np.int32)
+    
+    # Calculate number of batches
+    num_batches = int(np.ceil(total_valid_pixels / batch_size))
+    print(f"Processing {total_valid_pixels:,} valid pixels in {num_batches} batches")
+    
+    # Process each batch
     for batch_idx in range(num_batches):
-        batch_start = batch_idx * batch_size
-        batch_end = min((batch_idx + 1) * batch_size, valid_pixels)
-        batch_size_actual = batch_end - batch_start
+        print(f"Processing batch {batch_idx + 1}/{num_batches}...")
         
-        print(f"Processing batch {batch_idx+1}/{num_batches}, {batch_size_actual:,} pixels")
+        # Get batch indices
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, total_valid_pixels)
         
-        # Get indices for this batch
-        batch_indices = valid_indices[batch_start:batch_end]
+        batch_y_indices = y_indices[start_idx:end_idx]
+        batch_x_indices = x_indices[start_idx:end_idx]
+        batch_size_actual = end_idx - start_idx
         
-        # Create feature array for this batch
+        # Initialize feature array for this batch
         X_batch = np.zeros((batch_size_actual, num_features), dtype=np.float32)
         
-        # Add DEM features (first column)
-        X_batch[:, 0] = dem.flatten()[batch_indices]
+        # Extract base features (DEM, slope, rainfall) using chunked processing
+        print(f"  Extracting base features for {batch_size_actual:,} pixels...")
         
-        # Add slope features (second column) - calculate on demand if needed
-        if use_precalculated_slope:
-            X_batch[:, 1] = slope.flatten()[batch_indices]
-        else:
-            # Calculate slope on demand for pixels in this batch
-            # Group batch indices by chunks to minimize slope calculations
-            y_indices = batch_indices // width
-            x_indices = batch_indices % width
-            
-            # Find unique chunks that contain pixels from this batch
-            chunk_y_indices = y_indices // chunk_size
-            chunk_x_indices = x_indices // chunk_size
-            unique_chunks = set(zip(chunk_y_indices, chunk_x_indices))
-            
-            # Calculate slope for each needed chunk and extract values
-            slope_values = np.zeros(batch_size_actual, dtype=np.float32)
-            
-            for chunk_y, chunk_x in unique_chunks:
-                # Calculate chunk boundaries
-                y_start = chunk_y * chunk_size
-                y_end = min((chunk_y + 1) * chunk_size, height)
-                x_start = chunk_x * chunk_size
-                x_end = min((chunk_x + 1) * chunk_size, width)
+        # Use larger chunks for feature extraction to reduce overhead
+        feature_chunk_size = 2048
+        n_feature_chunks_y = int(np.ceil(height / feature_chunk_size))
+        n_feature_chunks_x = int(np.ceil(width / feature_chunk_size))
+        
+        # Initialize feature arrays
+        dem_features = np.zeros(batch_size_actual, dtype=np.float32)
+        slope_features = np.zeros(batch_size_actual, dtype=np.float32)
+        
+        # Process each chunk and extract features for pixels in this batch
+        for chunk_y in range(n_feature_chunks_y):
+            for chunk_x in range(n_feature_chunks_x):
+                y_chunk_start = chunk_y * feature_chunk_size
+                y_chunk_end = min((chunk_y + 1) * feature_chunk_size, height)
+                x_chunk_start = chunk_x * feature_chunk_size
+                x_chunk_end = min((chunk_x + 1) * feature_chunk_size, width)
                 
-                # Extract DEM chunk with padding for slope calculation
+                # Find pixels in this batch that belong to this chunk
+                in_chunk = ((batch_y_indices >= y_chunk_start) & (batch_y_indices < y_chunk_end) & 
+                           (batch_x_indices >= x_chunk_start) & (batch_x_indices < x_chunk_end))
+                
+                if not np.any(in_chunk):
+                    continue
+                
+                # Load chunk data with padding for slope calculation
                 pad_size = 2
-                y_start_padded = max(0, y_start - pad_size)
-                x_start_padded = max(0, x_start - pad_size)
-                y_end_padded = min(height, y_end + pad_size)
-                x_end_padded = min(width, x_end + pad_size)
+                y_start_padded = max(0, y_chunk_start - pad_size)
+                x_start_padded = max(0, x_chunk_start - pad_size)
+                y_end_padded = min(height, y_chunk_end + pad_size)
+                x_end_padded = min(width, x_chunk_end + pad_size)
                 
-                dem_chunk_padded = dem[y_start_padded:y_end_padded, x_start_padded:x_end_padded]
-                mask_chunk_padded = mask[y_start_padded:y_end_padded, x_start_padded:x_end_padded]
+                dem_chunk_padded = dem_dask[y_start_padded:y_end_padded, x_start_padded:x_end_padded].values.astype(np.float32)
+                
+                # Create mask for this chunk
+                if nodata_value is not None and not np.isnan(nodata_value):
+                    mask_chunk_padded = np.logical_and(dem_chunk_padded != nodata_value, ~np.isnan(dem_chunk_padded))
+                else:
+                    mask_chunk_padded = ~np.isnan(dem_chunk_padded)
+                
+                # Replace invalid values
+                dem_chunk_padded[~mask_chunk_padded] = -9999
+                
+                # Normalize DEM
+                dem_norm_padded = dem_chunk_padded.copy()
+                dem_norm_padded[mask_chunk_padded] = (dem_chunk_padded[mask_chunk_padded] - dem_mean) / dem_std
+                dem_norm_padded[~mask_chunk_padded] = 0
                 
                 # Calculate slope for this chunk
                 with warnings.catch_warnings():
@@ -591,47 +721,76 @@ def extract_features_batched(pred_result, batch_size=1000000):
                     slope_chunk_padded = calc_slope(dem_chunk_padded)
                     slope_chunk_padded[~mask_chunk_padded] = 0
                 
-                # Extract the actual chunk area from the padded slope
-                pad_y_offset = y_start - y_start_padded
-                pad_x_offset = x_start - x_start_padded
-                actual_chunk_h = y_end - y_start
-                actual_chunk_w = x_end - x_start
+                # Extract the actual chunk area from the padded data
+                pad_y_offset = y_chunk_start - y_start_padded
+                pad_x_offset = x_chunk_start - x_start_padded
+                actual_chunk_h = y_chunk_end - y_chunk_start
+                actual_chunk_w = x_chunk_end - x_chunk_start
+                
+                dem_chunk = dem_norm_padded[
+                    pad_y_offset:pad_y_offset + actual_chunk_h,
+                    pad_x_offset:pad_x_offset + actual_chunk_w
+                ]
                 
                 slope_chunk = slope_chunk_padded[
                     pad_y_offset:pad_y_offset + actual_chunk_h,
                     pad_x_offset:pad_x_offset + actual_chunk_w
                 ]
                 
-                # Find pixels in this batch that belong to this chunk
-                in_chunk = ((y_indices >= y_start) & (y_indices < y_end) & 
-                           (x_indices >= x_start) & (x_indices < x_end))
+                # Extract features for pixels in this batch that belong to this chunk
+                batch_y_in_chunk = batch_y_indices[in_chunk] - y_chunk_start
+                batch_x_in_chunk = batch_x_indices[in_chunk] - x_chunk_start
                 
-                if np.any(in_chunk):
-                    # Extract slope values for pixels in this batch
-                    batch_y_in_chunk = y_indices[in_chunk] - y_start
-                    batch_x_in_chunk = x_indices[in_chunk] - x_start
-                    slope_values[in_chunk] = slope_chunk[batch_y_in_chunk, batch_x_in_chunk]
-            
-            X_batch[:, 1] = slope_values
+                dem_features[in_chunk] = dem_chunk[batch_y_in_chunk, batch_x_in_chunk]
+                slope_features[in_chunk] = slope_chunk[batch_y_in_chunk, batch_x_in_chunk]
         
-        # Add rainfall features (third column)
-        X_batch[:, 2] = rainfall.flatten()[batch_indices]
+        # Add base features to batch
+        X_batch[:, 0] = dem_features
+        X_batch[:, 1] = slope_features
+        X_batch[:, 2] = rainfall_m  # Uniform rainfall for all pixels
         
-        # Add model probabilities (remaining columns)
+        # Add model probabilities (remaining columns) from zarr files - vectorized approach
         feature_idx = num_base_features
-        for model_name in dl_models:
-            model_probs = probs[model_name]
-            for class_idx in range(5):
-                X_batch[:, feature_idx] = model_probs[class_idx].flatten()[batch_indices]
-                feature_idx += 1
         
+        print(f"  Extracting model probabilities for {batch_size_actual:,} pixels...")
+        for model_name in dl_models:
+            probs_path = probs_paths[model_name]
+            if probs_path is None:
+                print(f"    Skipping {model_name} (failed)")
+                continue
+                
+            print(f"    Loading probabilities from {model_name}...")
+            
+            # Load zarr array
+            probs_zarr = zarr.open(probs_path, mode='r')
+            
+            # Extract probabilities for all 5 classes in batches to avoid memory issues
+            prob_batch_size = min(50000, batch_size_actual)  # Process in smaller chunks
+            
+            for prob_start in range(0, batch_size_actual, prob_batch_size):
+                prob_end = min(prob_start + prob_batch_size, batch_size_actual)
+                
+                prob_y_indices = batch_y_indices[prob_start:prob_end]
+                prob_x_indices = batch_x_indices[prob_start:prob_end]
+                
+                # Read all 5 class probabilities at once using advanced indexing
+                probs_batch = probs_zarr[:, prob_y_indices, prob_x_indices]  # Shape: (5, n_pixels)
+                
+                # Add to feature matrix
+                for class_idx in range(5):
+                    X_batch[prob_start:prob_end, feature_idx + class_idx] = probs_batch[class_idx]
+            
+            feature_idx += 5
+        
+        # Return this batch
+        batch_indices = np.column_stack((batch_y_indices, batch_x_indices))
         yield X_batch, batch_indices, height, width
 
 def run_meta_model_inference(data, meta_model, base_models, output_file, 
-                           window_size=512, overlap=128, sigma=0.5, batch_size=1000000):
+                           window_size=512, overlap=128, sigma=0.5, batch_size=1000000, n_workers=None):
     """
     Run inference using the meta-model on the provided DEM data.
-    Processes large DEMs in batches to avoid memory issues.
+    Processes large DEMs with memory-efficient approaches.
     
     Args:
         data: Dictionary with DEM data and metadata
@@ -648,9 +807,9 @@ def run_meta_model_inference(data, meta_model, base_models, output_file,
     """
     print("\nRunning meta-model inference...")
     
-    # Get base model predictions with Gaussian kernel smoothing
-    pred_result = get_model_predictions(data, base_models, 
-                                      window_size=window_size, overlap=overlap, sigma=sigma)
+    # Get base model predictions with memory-efficient approach
+    pred_result = get_model_predictions(data, base_models, output_file, 
+                                      window_size=window_size, overlap=overlap, sigma=sigma, n_workers=n_workers)
     
     if pred_result is None:
         print("No valid predictions. Exiting.")
@@ -660,12 +819,17 @@ def run_meta_model_inference(data, meta_model, base_models, output_file,
     output_nodata = data['output_nodata']
     
     # Get dimensions
-    height, width = data['dem'].shape
-    total_pixels = height * width
+    height = data['height']
+    width = data['width']
     
     # Initialize the full prediction array with nodata value
     print(f"Initializing prediction array of size {height}x{width}")
     meta_pred = np.ones((height, width), dtype=np.uint8) * output_nodata
+    
+    # Use smaller batch size for very large arrays to be more conservative
+    if height * width > 50000000:  # >50M pixels
+        batch_size = min(batch_size, 500000)  # Use smaller batches
+        print(f"Large DEM detected, using conservative batch size: {batch_size:,}")
     
     # Process features and make predictions in batches
     print("Extracting features and making predictions in batches...")
@@ -682,8 +846,8 @@ def run_meta_model_inference(data, meta_model, base_models, output_file,
             batch_time = time.time() - batch_start_time
             
             # Place batch predictions into the full prediction array
-            y_indices = batch_indices // width
-            x_indices = batch_indices % width
+            y_indices = batch_indices[:, 0]
+            x_indices = batch_indices[:, 1]
             
             # Assign predictions
             for i in range(len(batch_indices)):
@@ -696,9 +860,6 @@ def run_meta_model_inference(data, meta_model, base_models, output_file,
             del X_batch, meta_pred_batch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-        
-        # Apply the original mask (to handle any inconsistencies)
-        meta_pred[~data['original_mask']] = output_nodata
         
         # Report total time
         inference_time = time.time() - start_time
@@ -724,7 +885,7 @@ def run_meta_model_inference(data, meta_model, base_models, output_file,
         
         # Save meta-model prediction
         meta_zarr_path = output_file
-        save_zarr(meta_pred, meta_zarr_path, data['geotiff_meta'], original_mask=data['original_mask'])
+        save_zarr(meta_pred, meta_zarr_path, data['geotiff_meta'], original_mask=None)
         
         # Save top 3 base model predictions
         base_models_to_save = min(3, len(pred_result['predictions']))
@@ -734,7 +895,7 @@ def run_meta_model_inference(data, meta_model, base_models, output_file,
             for i, model_name in enumerate(model_names[:base_models_to_save]):
                 base_output_file = output_file.replace('.zarr', f'_{model_name}.zarr')
                 save_zarr(pred_result['predictions'][model_name], 
-                         base_output_file, data['geotiff_meta'], original_mask=data['original_mask'])
+                         base_output_file, data['geotiff_meta'], original_mask=None)
         
         return pred_result
     
@@ -760,38 +921,65 @@ def create_visualization(data, pred_result, output_file):
         flood_colors = [FLOOD_COLORS[FloodCategory(i)] for i in range(len(FloodCategory))]
         cmap = ListedColormap(flood_colors)
         
-        # Get data
-        dem = data['dem']
-        mask = data['mask']
-        rainfall_mm = data['rainfall_mm']  # Get rainfall from original data
+        # Get data from the lazy-loaded structure
+        dem_dask = data['dem_dask']
+        height = data['height']
+        width = data['width']
+        rainfall_mm = data['rainfall_mm']
         meta_pred = pred_result['meta_prediction']
         base_preds = pred_result['predictions']
         output_nodata = data['output_nodata']
         county_info = data['county_info']
+        nodata_value = data['nodata_value']
+        dem_mean = data['dem_mean']
+        dem_std = data['dem_std']
         
         # Check if the visualization would be too large
-        height, width = dem.shape
         total_pixels = height * width
         max_viz_pixels = 2000000  # 2 million pixels max for visualization
         
-        # If the image is too large, downsample it
+        # Calculate downsampling ratio if needed
         if total_pixels > max_viz_pixels:
             downsample_ratio = int(np.ceil(np.sqrt(total_pixels / max_viz_pixels)))
             print(f"Image too large for visualization ({height}x{width}). Downsampling by factor of {downsample_ratio}.")
             
-            # Downsample data
-            dem_ds = dem[::downsample_ratio, ::downsample_ratio]
-            mask_ds = mask[::downsample_ratio, ::downsample_ratio]
+            # Downsample DEM data
+            dem_sampled = dem_dask[::downsample_ratio, ::downsample_ratio].values.astype(np.float32)
+            
+            # Create mask and normalize sampled DEM
+            if nodata_value is not None and not np.isnan(nodata_value):
+                mask_sampled = np.logical_and(dem_sampled != nodata_value, ~np.isnan(dem_sampled))
+            else:
+                mask_sampled = ~np.isnan(dem_sampled)
+            
+            # Normalize DEM for display
+            dem_norm_sampled = dem_sampled.copy()
+            dem_norm_sampled[mask_sampled] = (dem_sampled[mask_sampled] - dem_mean) / dem_std
+            dem_norm_sampled[~mask_sampled] = np.nan
+            
+            # Downsample predictions
             meta_pred_ds = meta_pred[::downsample_ratio, ::downsample_ratio]
             
-            # Downsample base predictions
             downsampled_base_preds = {}
             for model_name, pred in base_preds.items():
                 downsampled_base_preds[model_name] = pred[::downsample_ratio, ::downsample_ratio]
             base_preds = downsampled_base_preds
         else:
-            dem_ds = dem
-            mask_ds = mask
+            # Load full DEM for smaller images
+            print("Loading full DEM for visualization...")
+            dem_full = dem_dask.values.astype(np.float32)
+            
+            # Create mask
+            if nodata_value is not None and not np.isnan(nodata_value):
+                mask_full = np.logical_and(dem_full != nodata_value, ~np.isnan(dem_full))
+            else:
+                mask_full = ~np.isnan(dem_full)
+            
+            # Normalize DEM for display
+            dem_norm_sampled = dem_full.copy()
+            dem_norm_sampled[mask_full] = (dem_full[mask_full] - dem_mean) / dem_std
+            dem_norm_sampled[~mask_full] = np.nan
+            mask_sampled = mask_full
             meta_pred_ds = meta_pred
         
         # Calculate how many subplots we need
@@ -819,10 +1007,8 @@ def create_visualization(data, pred_result, output_file):
             axes[i].axis('off')
         
         # Plot DEM
-        dem_plot = dem_ds.copy()
-        dem_plot[~mask_ds] = np.nan
         axes[0].set_title("DEM")
-        im = axes[0].imshow(dem_plot, cmap='terrain')
+        im = axes[0].imshow(dem_norm_sampled, cmap='terrain')
         plt.colorbar(im, ax=axes[0], label='Elevation (normalized)')
         
         # Plot meta-model prediction
@@ -1050,6 +1236,126 @@ def save_geotiff(data, output_path, meta=None, nodata=None, original_mask=None):
         import traceback
         traceback.print_exc()
 
+def process_window_batch_threaded(window_coords_batch, model, dem_dask, 
+                                 rainfall_m, dem_mean, dem_std, nodata_value, 
+                                 window_size, weight_map, gpu_lock):
+    """
+    Process a batch of windows using shared model and data (thread-safe).
+    
+    Args:
+        window_coords_batch: List of (y_idx, x_idx, y_start, x_start, y_end, x_end) tuples
+        model: Shared model instance
+        dem_dask: Shared DEM dask array
+        rainfall_m: Rainfall value in meters
+        dem_mean: DEM mean for normalization
+        dem_std: DEM standard deviation for normalization
+        nodata_value: No data value
+        window_size: Window size for processing
+        weight_map: Gaussian weight map
+        gpu_lock: Threading lock for GPU access
+        
+    Returns:
+        List of (window_coords, predictions, weights) tuples
+    """
+    results = []
+    
+    for window_coords in window_coords_batch:
+        try:
+            y_idx, x_idx, y_start, x_start, y_end, x_end = window_coords
+            
+            # Calculate padded window coordinates for slope calculation
+            pad_size = 2
+            height, width = dem_dask.shape
+            y_start_padded = max(0, y_start - pad_size)
+            x_start_padded = max(0, x_start - pad_size)
+            y_end_padded = min(height, y_end + pad_size)
+            x_end_padded = min(width, x_end + pad_size)
+            
+            # Load only the padded window data from the dask array
+            dem_raw_padded = dem_dask[y_start_padded:y_end_padded, x_start_padded:x_end_padded].values.astype(np.float32)
+            
+            # Create a mask for valid data in the padded window
+            if nodata_value is not None and not np.isnan(nodata_value):
+                mask_padded = np.logical_and(dem_raw_padded != nodata_value, ~np.isnan(dem_raw_padded))
+            else:
+                mask_padded = ~np.isnan(dem_raw_padded)
+            
+            # Replace invalid values with a sentinel value for processing
+            dem_raw_padded[~mask_padded] = -9999
+            
+            # Calculate slope for the padded window
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', category=RuntimeWarning)
+                slope_padded = calc_slope(dem_raw_padded)
+                slope_padded[~mask_padded] = 0
+            
+            # Normalize the DEM data for the padded window
+            dem_norm_padded = dem_raw_padded.copy()
+            dem_norm_padded[mask_padded] = (dem_raw_padded[mask_padded] - dem_mean) / dem_std
+            dem_norm_padded[~mask_padded] = 0
+            
+            # Extract the actual window area from the padded data
+            pad_y_offset = y_start - y_start_padded
+            pad_x_offset = x_start - x_start_padded
+            actual_window_h = y_end - y_start
+            actual_window_w = x_end - x_start
+            
+            slope_window = slope_padded[
+                pad_y_offset:pad_y_offset + actual_window_h,
+                pad_x_offset:pad_x_offset + actual_window_w
+            ]
+            
+            dem_window = dem_norm_padded[
+                pad_y_offset:pad_y_offset + actual_window_h,
+                pad_x_offset:pad_x_offset + actual_window_w
+            ]
+            
+            window_mask = mask_padded[
+                pad_y_offset:pad_y_offset + actual_window_h,
+                pad_x_offset:pad_x_offset + actual_window_w
+            ]
+            
+            # Create rainfall window
+            rainfall_window = np.ones_like(dem_window) * rainfall_m
+            rainfall_window[~window_mask] = 0
+            
+            # Handle window size if smaller than crop_size
+            window_h, window_w = dem_window.shape
+            if window_h < window_size or window_w < window_size:
+                pad_h = max(0, window_size - window_h)
+                pad_w = max(0, window_size - window_w)
+                dem_window = np.pad(dem_window, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+                slope_window = np.pad(slope_window, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+                rainfall_window = np.pad(rainfall_window, ((0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+            
+            # Prepare input tensor
+            model_input = np.stack([dem_window, slope_window, rainfall_window])
+            input_tensor = torch.from_numpy(model_input).unsqueeze(0).to(DEVICE)
+            
+            # Use GPU lock to prevent conflicts
+            with gpu_lock:
+                with torch.no_grad():
+                    output = model(input_tensor)
+                    pred = output.output.squeeze().detach().cpu().numpy()
+            
+            # Extract actual window dimensions and weights
+            window_h = y_end - y_start
+            window_w = x_end - x_start
+            current_weight = weight_map[:window_h, :window_w]
+            
+            # Apply weights to prediction probabilities
+            weighted_probs = np.zeros((pred.shape[0], window_h, window_w), dtype=np.float32)
+            for c in range(pred.shape[0]):
+                weighted_probs[c] = pred[c, :window_h, :window_w] * current_weight
+            
+            results.append((window_coords, weighted_probs, current_weight))
+            
+        except Exception as e:
+            print(f"Error processing window {window_coords}: {e}")
+            continue
+    
+    return results
+
 def main(args):
     """Main function to run meta-model inference on a DEM Zarr file."""
     # Create output directory if needed
@@ -1061,6 +1367,7 @@ def main(args):
     print(f"Window size: {args.window_size}, Overlap: {args.overlap}, Sigma: {args.sigma}")
     print(f"Batch size: {args.batch_size:,} pixels")
     print(f"Parallel jobs for meta-model: {args.n_jobs}")
+    print(f"Parallel workers for window processing: {args.n_workers or 'auto'}")
     
     # Load meta-model with parallel prediction
     meta_model = load_meta_model(args.meta_model, n_jobs=args.n_jobs)
@@ -1086,7 +1393,8 @@ def main(args):
         window_size=args.window_size, 
         overlap=args.overlap,
         sigma=args.sigma,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        n_workers=args.n_workers
     )
     
     if result:
@@ -1107,7 +1415,7 @@ if __name__ == "__main__":
                         help='Output file path for the Zarr result')
     parser.add_argument('--window_size', type=int, default=512,
                         help='Size of window for processing (default: 512)')
-    parser.add_argument('--overlap', type=int, default=128,
+    parser.add_argument('--overlap', type=int, default=64,
                         help='Overlap between adjacent windows in pixels (default: 128)')
     parser.add_argument('--sigma', type=float, default=0.5,
                         help='Standard deviation for Gaussian kernel (default: 0.5)')
@@ -1115,6 +1423,8 @@ if __name__ == "__main__":
                         help='Maximum number of pixels to process in each batch (default: 5,000,000)')
     parser.add_argument('--n_jobs', type=int, default=-1,
                         help='Number of parallel jobs for meta-model prediction (-1 for all cores, default: -1)')
+    parser.add_argument('--n_workers', type=int, default=None,
+                        help='Number of parallel threads for window processing (default: min(8, cpu_count()))')
     
     args = parser.parse_args()
     main(args)
